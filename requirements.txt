@@ -1,0 +1,7 @@
+flask>=2.3
+numpy>=1.24
+scipy>=1.10
+laspy>=2.5
+lazrs>=0.5
+plyfile>=0.9
+scikit-learn>=1.3

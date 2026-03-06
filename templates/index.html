@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Point Cloud Viewer</title>
+  <link rel="stylesheet" href="/static/css/style.css"/>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+
+<!-- MENU BAR -->
+<div id="menuBar">
+  <div class="menu-item"><span class="menu-label">File</span>
+    <div class="dropdown">
+      <div class="dropdown-item" id="menuOpen"><span class="si">📂</span> Open Point Cloud…</div>
+      <div class="dropdown-divider"></div>
+      <div class="dropdown-item" id="menuExportCSV"><span class="si">💾</span> Export Clicks CSV</div>
+      <div class="dropdown-item" id="menuExport"><span class="si">📸</span> Export Screenshot</div>
+      <div class="dropdown-divider"></div>
+      <div class="dropdown-item" id="menuCloseAll"><span class="si">🗑</span> Close All</div>
+    </div>
+  </div>
+  <div class="menu-item"><span class="menu-label">Display</span>
+    <div class="dropdown">
+      <div class="dropdown-item" id="menuToggleGrid">Toggle Grid</div>
+      <div class="dropdown-item" id="menuToggleAxes">Toggle Axes</div>
+      <div class="dropdown-divider"></div>
+      <div class="dropdown-item" id="menuDisplayWhite"><span class="di-check" id="chkWhite">●</span> White</div>
+      <div class="dropdown-item" id="menuDisplayNormal"><span class="di-check" id="chkNormal">○</span> Normal</div>
+      <div class="dropdown-item" id="menuDisplayCurvature"><span class="di-check" id="chkCurvature">○</span> Curvature</div>
+      <div class="dropdown-divider"></div>
+      <div class="dropdown-item" id="menuBgBlack">Background: Black</div>
+      <div class="dropdown-item" id="menuBgGradient">Background: Gradient</div>
+      <div class="dropdown-item" id="menuBgWhite">Background: White</div>
+    </div>
+  </div>
+  <div class="menu-item"><span class="menu-label">Tools</span>
+    <div class="dropdown">
+      <div class="dropdown-item" id="menuToolsExport"><span class="si">💾</span> Export Clicks CSV</div>
+      <div class="dropdown-item" id="menuClearClicks"><span class="si">🗑</span> Clear All Clicks</div>
+    </div>
+  </div>
+  <div class="menu-item"><span class="menu-label">3D Views</span>
+    <div class="dropdown">
+      <div class="dropdown-item" data-view="top">Top</div>
+      <div class="dropdown-item" data-view="front">Front</div>
+      <div class="dropdown-item" data-view="right">Right</div>
+      <div class="dropdown-item" data-view="iso">Isometric</div>
+    </div>
+  </div>
+  <div class="menu-item"><span class="menu-label">Help</span>
+    <div class="dropdown">
+      <div class="dropdown-item" id="menuShortcuts">Shortcuts</div>
+    </div>
+  </div>
+</div>
+
+<!-- TOOLBAR -->
+<div id="toolbar">
+  <button class="tb" id="tbOpen" title="Open (Ctrl+O)">📂</button>
+  <div class="ts"></div>
+  <button class="tb tb-lighting active" id="tbLighting" title="Lighting ON (L)">💡</button>
+  <div class="ts"></div>
+  <button class="tb tb-export" id="tbExportCSV" title="Export Clicks CSV">💾</button>
+  <div class="ts"></div>
+  <label class="tl">Size:</label>
+  <input type="range" id="ptSlider" min="0.5" max="10" step="0.1" value="2.0" class="tslider"/>
+  <span id="ptVal" class="tv">2.0</span>
+</div>
+
+<!-- MAIN LAYOUT -->
+<div id="mainLayout">
+  <!-- LEFT SIDEBAR -->
+  <div id="leftSidebar">
+    <div class="panel" id="dbTreePanel">
+      <div class="ph"><span>DB Tree</span></div>
+      <div class="pb" id="dbTree"><div class="empty">No point clouds loaded.<br/><b>File → Open</b></div></div>
+    </div>
+    <div class="vresizer" data-top="dbTreePanel" data-bottom="propsPanel"></div>
+    <div class="panel" id="propsPanel">
+      <div class="ph"><span>Properties</span></div>
+      <div class="pb" id="propsBody"><div class="empty">Select an item.</div></div>
+    </div>
+  </div>
+  <div class="hresizer" data-target="leftSidebar" data-side="left"></div>
+
+  <!-- MAIN VIEWPORT -->
+  <div id="viewport">
+    <div id="colorScaleBar" style="display:none;">
+      <div id="colorScaleTitle">Normal Direction</div>
+      <div id="colorScaleGradient"></div>
+      <div id="colorScaleLabels"></div>
+    </div>
+    <div id="viewportContainer"></div>
+    <div id="orientCube"><canvas id="cubeCanvas" width="90" height="90"></canvas></div>
+    <div id="coordBar"><span id="coordText">X: — Y: — Z: —</span></div>
+    <div id="isolatedBanner" style="display:none;">
+      <span id="isolatedLabel">Cluster #0</span>
+      <button id="clearIsolation">✕ Show All</button>
+    </div>
+    <div class="vresizer" id="viewportResizer" data-top="viewportContainer" data-bottom="bottomInfoPanel"></div>
+    <div id="bottomInfoPanel">
+      <div class="ph"><span>Click Log</span></div>
+      <div class="pb" id="clickLogBody"><div class="empty">Double-click points to log them here.</div></div>
+    </div>
+    <div id="statusBar">
+      <span id="statusText">Ready</span>
+      <span id="ptCount">Points: 0</span>
+      <span id="fpsEl">FPS: —</span>
+    </div>
+  </div>
+  <div class="hresizer" data-target="rightPanel" data-side="right"></div>
+
+  <!-- RIGHT PANEL (fixed size — no resizers) -->
+  <div id="rightPanel">
+    <div class="panel" id="clusterViewPanel">
+      <div class="ph"><span>Clustered View</span></div>
+      <div id="clusterViewContainer"></div>
+    </div>
+    <div class="panel" id="clusterPropsPanel">
+      <div class="ph"><span>Cluster Properties</span></div>
+      <div class="pb" id="clusterPropsBody"><div class="empty">Upload a point cloud to see clusters.</div></div>
+    </div>
+    <div class="panel" id="paramsPanel">
+      <div class="ph"><span>Parameters</span></div>
+      <div class="pb" id="paramsBody">
+        <div class="param-row"><label>eps Parameter:</label><input type="number" id="pGridRes" value="0.6" step="0.1" min="0.05" max="10"/></div>
+        <button class="action-btn" id="btnRecluster">Cluster & Linearize</button>
+        <div class="param-divider"></div>
+        <div class="param-divider"></div>
+        <div class="param-row"><label>Row Height:</label>
+          <input type="range" id="pRowHeight" min="100" max="900" step="10" value="100" style="flex:1"/>
+          <span id="rowHeightVal" style="min-width:32px;text-align:right;font-size:10px;">Auto</span>
+        </div>
+        <div class="param-row"><label>Overlap Fraction:</label><input type="number" id="pOverlap" value="0.15" step="0.05" min="0" max="0.5"/></div>
+        <button class="action-btn overlap-btn" id="btnApplyOverlap">Apply Overlap (fast)</button>
+        <div class="param-divider"></div>
+        <div class="param-section-label">Marker Settings</div>
+        <div class="param-row"><label>Marker Color:</label><input type="color" id="markerColor" value="#ff0000" title="Marker color"/></div>
+        <div class="param-row"><label>Marker Size:</label>
+          <input type="range" id="markerSizeSlider" min="0.3" max="4" step="0.1" value="1.0" style="flex:1"/>
+          <span id="markerSizeVal" style="min-width:28px;text-align:right;">1.0</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- UPLOAD MODAL -->
+<div id="uploadModal" class="modal-overlay">
+  <div class="modal-box">
+    <div class="mh"><span>Open Point Cloud</span><button class="mc" id="closeModal">✕</button></div>
+    <div class="mb">
+      <div class="upload-zone" id="uploadZone">
+        <div style="font-size:42px;margin-bottom:8px;">☁️</div>
+        <p>Drag & drop point cloud here</p>
+        <p class="hint">Supported: .las .laz .ply .xyz .asc .txt</p>
+        <button class="browse-btn" id="browseBtn">Browse Files…</button>
+        <input type="file" id="fileInput" accept=".las,.laz,.ply,.xyz,.asc,.txt,.csv" style="display:none"/>
+      </div>
+      <div class="annotation-section" style="margin-top:10px;padding:8px 12px;border:1px solid var(--bd);border-radius:6px;background:var(--bg2);">
+        <label style="font-size:11px;color:var(--txd);display:flex;align-items:center;gap:6px;">
+          <span>📋 Annotation / Ground Truth (optional):</span>
+        </label>
+        <div style="display:flex;align-items:center;gap:6px;margin-top:4px;">
+          <button class="browse-btn" id="browseAnnBtn" style="font-size:11px;padding:3px 10px;">Browse…</button>
+          <span id="annFileName" style="font-size:11px;color:var(--txd);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;">No file selected</span>
+          <button id="clearAnnBtn" style="display:none;background:none;border:none;color:#f66;cursor:pointer;font-size:14px;" title="Remove">✕</button>
+        </div>
+        <input type="file" id="annFileInput" accept=".txt,.csv,.asc,.labels,.ann,.gt" style="display:none"/>
+        <p class="hint" style="margin-top:4px;font-size:10px;">One label per line (integer class IDs)</p>
+      </div>
+      <div id="uploadProgress" style="display:none;">
+        <div class="pbar-track"><div class="pbar-fill" id="pFill"></div></div>
+        <p id="uploadStatus">Uploading…</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- SHORTCUTS -->
+<div id="shortcutsModal" class="modal-overlay">
+  <div class="modal-box sm">
+    <div class="mh"><span>Shortcuts</span><button class="mc" id="closeShortcuts">✕</button></div>
+    <div class="mb" style="padding:15px;">
+      <table class="sctbl">
+        <tr><td><kbd>F</kbd></td><td>Fit to view</td></tr>
+        <tr><td><kbd>R</kbd></td><td>Reset view</td></tr>
+        <tr><td><kbd>+/-</kbd></td><td>Point size</td></tr>
+        <tr><td><kbd>G</kbd></td><td>Grid</td></tr>
+        <tr><td><kbd>A</kbd></td><td>Axes</td></tr>
+        <tr><td><kbd>L</kbd></td><td>Toggle Lighting</td></tr>
+        <tr><td><kbd>1/2/3</kbd></td><td>Top/Front/Right</td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>Clear cluster isolation</td></tr>
+        <tr><td><b>Dbl-click</b></td><td>Mark / unmark point</td></tr>
+        <tr><td><b>Left-drag</b></td><td>Rotate</td></tr>
+        <tr><td><b>Right-drag</b></td><td>Pan</td></tr>
+        <tr><td><b>Scroll</b></td><td>Zoom (per row in linearized)</td></tr>
+        <tr><td><b>Hover cluster</b></td><td>Highlight in main view</td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div id="loadingOverlay"><div class="spinner"></div><p id="loadingText">Processing…</p></div>
+
+<script src="/static/js/viewer.js"></script>
+</body>
+</html>
