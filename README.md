@@ -31,7 +31,7 @@ python app.py
 4. **Click** a cluster in right panel for instant isolation
 5. **Double-click** any point to mark it (lit sphere marker)
 6. **Double-click** a marker to remove it
-7. **Export CSV** via toolbar 💾 button or File/Tools menu
+7. **Export CSV** via toolbar button or File/Tools menu
 8. **Apply Overlap** → fast re-linearization without re-clustering
 9. **Re-Cluster** → full re-clustering with new grid resolution
 
