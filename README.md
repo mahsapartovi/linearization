@@ -1,6 +1,6 @@
 # Point Cloud Viewer
 
-Web-based 3D point cloud visualization with Flask + Three.js.
+Web-based 3D point cloud visualization/linearization with Flask + Three.js.
 
 ## Features
 - **Lit point spheres**: Custom shader makes each point a tiny lit sphere with directional + ambient lighting
