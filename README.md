@@ -1,4 +1,4 @@
-# Point Cloud Viewer
+# Point Cloud Viewer and linearization
 
 Web-based 3D point cloud visualization/linearization with Flask + Three.js.
 
