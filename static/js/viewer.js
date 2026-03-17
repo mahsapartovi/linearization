@@ -70,6 +70,12 @@ let clickedPoints = [], clickMarkers = [], clickIdCounter = 0;
 let hoveredCluster = -1;
 let linBaseColors = null;      // Float32Array — white base colors for linearized view
 
+// Point hover ring — shows a glowing ring around the nearest point under cursor
+let _hoverRing = null;         // THREE.Mesh — reused across all scenes
+let _hoverRingScene = null;    // which scene the ring is currently in
+let _hoverRafPending = false;  // throttle flag
+let _lastHoverEvent = null;    // last mousemove event for RAF callback
+
 // Normal/Curvature display state
 let displayMode = 'white';     // 'white' | 'normal' | 'curvature'
 let normalColorsData = null;   // Float32Array — normal RGB per linearized point
@@ -372,6 +378,7 @@ function setupMainControls() {
   el.addEventListener("mousemove", e => {
     updateCoordReadout(e);
     highlightNearestAnnotationRow(e);
+    updatePointHoverRing(e);
     if(!dragVP||(!dragVP.isLeftDown&&!dragVP.isRightDown&&!dragVP.isMiddleDown)) return;
     const cur=new THREE.Vector2(e.clientX,e.clientY), delta=new THREE.Vector2().subVectors(cur,dragVP.lastMousePos);
     if(delta.length()>1.5) dragVP.mouseMoved=true;
@@ -381,6 +388,7 @@ function setupMainControls() {
     dragVP.lastMousePos.copy(cur);
   });
   el.addEventListener("mouseup", ()=>{if(dragVP){dragVP.isLeftDown=dragVP.isRightDown=dragVP.isMiddleDown=false;}});
+  el.addEventListener("mouseleave", () => { clearPointHoverRing(); });
   el.addEventListener("wheel", e=>{
     if (isRowMode) {
       const ri = getRowAtMouse(e.clientX, e.clientY);
@@ -396,6 +404,7 @@ function setupMainControls() {
     }
   },{passive:false});
   el.addEventListener("dblclick", e=>{
+    clearPointHoverRing();
     if (isRowMode) {
       const ri = getRowAtMouse(e.clientX, e.clientY);
       if (ri && !ri.row.vp.mouseMoved) onRowDoubleClick(e, ri);
@@ -476,6 +485,122 @@ function handleZoom(event,cam,vp) {
   if(cam===camera) updateMarkerSizes();
 }
 
+
+// ═══════════════════════════════════════════════════════════
+// POINT HOVER RING — glowing border around candidate click target
+// ═══════════════════════════════════════════════════════════
+
+function _getOrCreateHoverRing() {
+  if (_hoverRing) return _hoverRing;
+  // Build a circle outline using LineLoop
+  const segments = 32;
+  const pts = [];
+  for (let i = 0; i <= segments; i++) {
+    const a = (i / segments) * Math.PI * 2;
+    pts.push(new THREE.Vector3(Math.cos(a), Math.sin(a), 0));
+  }
+  const geo = new THREE.BufferGeometry().setFromPoints(pts);
+  const mat = new THREE.LineBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0.92,
+    depthTest: false,
+    linewidth: 1,  // note: only >1 on some WebGL implementations
+  });
+  _hoverRing = new THREE.LineLoop(geo, mat);
+  _hoverRing.renderOrder = 9999;
+  _hoverRing.visible = false;
+  return _hoverRing;
+}
+
+function _placeHoverRing(scene, position, radius) {
+  const ring = _getOrCreateHoverRing();
+  // Move ring to new scene if needed
+  if (_hoverRingScene && _hoverRingScene !== scene) {
+    _hoverRingScene.remove(ring);
+  }
+  if (_hoverRingScene !== scene) {
+    scene.add(ring);
+    _hoverRingScene = scene;
+  }
+  ring.position.copy(position);
+  ring.scale.setScalar(radius);
+  ring.visible = true;
+  // Pulse the opacity slightly using elapsed time
+  const t = (performance.now() % 1200) / 1200;
+  const pulse = 0.65 + 0.35 * Math.sin(t * Math.PI * 2);
+  ring.material.opacity = pulse;
+}
+
+function clearPointHoverRing() {
+  if (_hoverRing) _hoverRing.visible = false;
+}
+
+function _hoverRingRadius(camera, vp) {
+  // Scale ring so it appears as a fixed screen-space circle regardless of zoom
+  const dist = camera.position.distanceTo(vp.pivotPoint);
+  return Math.max(0.02, dist * 0.018);
+}
+
+function updatePointHoverRing(e) {
+  // Throttle to one raycast per animation frame
+  _lastHoverEvent = e;
+  if (_hoverRafPending) return;
+  _hoverRafPending = true;
+  requestAnimationFrame(() => {
+    _hoverRafPending = false;
+    const ev = _lastHoverEvent;
+    if (!ev) return;
+
+    if (isRowMode && linRows.length > 0) {
+      const ri = getRowAtMouse(ev.clientX, ev.clientY);
+      if (!ri) { clearPointHoverRing(); return; }
+
+      const rect = renderer.domElement.getBoundingClientRect();
+      const mx = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+      const my = -((ri.localY) / ri.rowH) * 2 + 1;
+      const rc = new THREE.Raycaster();
+      rc.setFromCamera(new THREE.Vector2(mx, my), ri.row.camera);
+      const dist = ri.row.camera.position.distanceTo(ri.row.vp.pivotPoint);
+      rc.params.Points.threshold = Math.max(0.005, Math.min(0.3, 0.012 * (dist / 15)));
+
+      const hits = rc.intersectObject(ri.row.points);
+      const colAttr = ri.row.points.geometry.attributes.color;
+      const validHit = hits.find(ix => {
+        if (!colAttr) return true;
+        return (colAttr.getX(ix.index) + colAttr.getY(ix.index) + colAttr.getZ(ix.index)) >= 0.01;
+      });
+
+      if (!validHit) { clearPointHoverRing(); return; }
+      const pa = ri.row.points.geometry.attributes.position;
+      const pos = new THREE.Vector3(pa.getX(validHit.index), pa.getY(validHit.index), pa.getZ(validHit.index));
+      _placeHoverRing(ri.row.scene, pos, _hoverRingRadius(ri.row.camera, ri.row.vp));
+
+    } else {
+      const target = getActiveMainTarget();
+      if (!target) { clearPointHoverRing(); return; }
+      const rect = renderer.domElement.getBoundingClientRect();
+      const mx = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+      const my = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+      const rc = new THREE.Raycaster();
+      rc.setFromCamera(new THREE.Vector2(mx, my), camera);
+      const dist = camera.position.distanceTo(mainVP.pivotPoint);
+      rc.params.Points.threshold = Math.max(0.005, Math.min(0.3, 0.012 * (dist / 15)));
+
+      const hits = rc.intersectObject(target);
+      const colAttr = target.geometry.attributes.color;
+      const validHit = hits.find(ix => {
+        if (!colAttr) return true;
+        return (colAttr.getX(ix.index) + colAttr.getY(ix.index) + colAttr.getZ(ix.index)) >= 0.01;
+      });
+
+      if (!validHit) { clearPointHoverRing(); return; }
+      const pa = target.geometry.attributes.position;
+      const pos = new THREE.Vector3(pa.getX(validHit.index), pa.getY(validHit.index), pa.getZ(validHit.index));
+      _placeHoverRing(scene, pos, _hoverRingRadius(camera, mainVP));
+    }
+  });
+}
 
 // ═══════════════════════════════════════════════════════════
 // HOVER HIGHLIGHT — cluster in right panel → highlight in main
@@ -618,8 +743,16 @@ function onMainDoubleClick(event) {
   if(!intersects.length){threshUsed=dynThresh*2;rc.params.Points.threshold=threshUsed;intersects=rc.intersectObject(target);}
   if(!intersects.length){threshUsed=dynThresh*4;rc.params.Points.threshold=threshUsed;intersects=rc.intersectObject(target);}
 
-  if (intersects.length>0) {
-    const hit=intersects[0];
+  // Skip invisible (black/discarded) points — the shader discards them visually but
+  // Three.js raycasting still hits them, causing misses from certain viewpoints.
+  const colAttrMain = target.geometry.attributes.color;
+  const hit = intersects.find(ix => {
+    if (!colAttrMain) return true;
+    const r = colAttrMain.getX(ix.index), g = colAttrMain.getY(ix.index), b = colAttrMain.getZ(ix.index);
+    return (r + g + b) >= 0.01;
+  });
+
+  if (hit) {
     const pi=hit.index;
     const pa=target.geometry.attributes.position;
     if(pi>=pa.count) return;
@@ -729,8 +862,17 @@ function onRowDoubleClick(event, ri) {
 
   let intersects = rc.intersectObject(ri.row.points);
   if (!intersects.length) { rc.params.Points.threshold *= 3; intersects = rc.intersectObject(ri.row.points); }
-  if (intersects.length > 0) {
-    const hit = intersects[0], pi = hit.index;
+
+  // Skip invisible (black/discarded) points
+  const colAttrRow = ri.row.points.geometry.attributes.color;
+  const rowHit = intersects.find(ix => {
+    if (!colAttrRow) return true;
+    const r = colAttrRow.getX(ix.index), g = colAttrRow.getY(ix.index), b = colAttrRow.getZ(ix.index);
+    return (r + g + b) >= 0.01;
+  });
+
+  if (rowHit) {
+    const hit = rowHit, pi = hit.index;
     const pa = ri.row.points.geometry.attributes.position;
     if (pi >= pa.count) return;
     const ex = pa.getX(pi), ey = pa.getY(pi), ez = pa.getZ(pi);
@@ -2140,16 +2282,16 @@ function isolateCluster(clusterId) {
 
       if (hasCluster) {
         targetRow = r;
-        // This row contains the cluster → show only it colored, hide others
+        // This row contains the cluster → show it with display-mode colors, dim others
         for (let i = 0; i < n; i++) {
           if (r.labels[i] === clusterId) {
-            arr[i*3] = cc[0]; arr[i*3+1] = cc[1]; arr[i*3+2] = cc[2];
+            arr[i*3] = r.baseColors[i*3]; arr[i*3+1] = r.baseColors[i*3+1]; arr[i*3+2] = r.baseColors[i*3+2];
           } else {
             arr[i*3] = 0.0; arr[i*3+1] = 0.0; arr[i*3+2] = 0.0;
           }
         }
       } else {
-        // Other rows → keep normal white colors (restore base)
+        // Other rows → keep normal display-mode colors (restore base)
         colAttr.array.set(r.baseColors);
       }
       colAttr.needsUpdate = true;
@@ -2184,14 +2326,29 @@ function isolateCluster(clusterId) {
     return;
   }
 
-  // ── Single-scene mode (no rows): original behavior ──
-  if (mainPoints) mainPoints.visible = false;
-
+  // ── Single-scene mode (no rows): show mainPoints filtered by cluster with display-mode colors ──
   if (activeIsolatedId !== null && isolatedMeshes[activeIsolatedId]) {
     isolatedMeshes[activeIsolatedId].visible = false;
   }
 
-  if (isolatedMeshes[clusterId]) {
+  // Keep mainPoints visible — paint cluster with display-mode colors, dim others
+  if (mainPoints && linLabels && linBaseColors) {
+    mainPoints.visible = true;
+    const colAttr = mainPoints.geometry.attributes.color;
+    const arr = colAttr.array;
+    const n = linLabels.length;
+    for (let i = 0; i < n; i++) {
+      if (linLabels[i] === clusterId) {
+        arr[i*3] = linBaseColors[i*3]; arr[i*3+1] = linBaseColors[i*3+1]; arr[i*3+2] = linBaseColors[i*3+2];
+      } else {
+        arr[i*3] = 0.0; arr[i*3+1] = 0.0; arr[i*3+2] = 0.0;
+      }
+    }
+    colAttr.needsUpdate = true;
+    fitCamera(mainPoints, camera, mainVP);
+  } else if (isolatedMeshes[clusterId]) {
+    // Fallback: use pre-built isolated mesh
+    mainPoints.visible = false;
     isolatedMeshes[clusterId].visible = true;
     fitCamera(isolatedMeshes[clusterId], camera, mainVP);
   }
@@ -2239,7 +2396,13 @@ function clearIsolation() {
     isolatedMeshes[activeIsolatedId].visible = false;
   }
 
+  // Restore display-mode base colors on mainPoints
   mainPoints.visible = true;
+  if (linBaseColors) {
+    const colAttr = mainPoints.geometry.attributes.color;
+    colAttr.array.set(linBaseColors);
+    colAttr.needsUpdate = true;
+  }
   activeIsolatedId = null;
   repositionAllMarkers();
   fitCameraFront(mainPoints, camera, mainVP);
@@ -2311,7 +2474,7 @@ function setupRecluster() {
     lastEpsParam = gr;
     showLoading(isRawMode ? "Clustering & linearizing…" : "Re-clustering…");
     fetch("/recluster", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cloud_id: cloudId, eps_param: gr, overlap: ov }) })
+      body: JSON.stringify({ cloud_id: cloudId, grid_resolution: gr, overlap: ov }) })
     .then(r => r.json()).then(d => {
       hideLoading();
       if (d.error) { status("Error: " + d.error); return; }
@@ -2360,6 +2523,7 @@ function reloadViews(d) {
   isolatedMeshes = {};
   if (clusterPoints) cScene.remove(clusterPoints);
   clearClicksQuiet();
+  clearClickLog();
   clearHoverHighlight();
   hoveredCluster = -1;
   activeIsolatedId = null;
@@ -2424,9 +2588,14 @@ function reloadViews(d) {
     buildAnnotationMarkers();
     addAnnotationLogEntries(annotationPositions);
   } else if (annotationPositions && annotationPositions.length > 0) {
+    // No new positions from server — rebuild markers using existing coords
     buildAnnotationMarkers();
+    addAnnotationLogEntries(annotationPositions);
   }
   updateDBTree();
+
+  // Restore user-placed click markers (same as loadCloud)
+  loadSavedClicks();
 
   cloudData.linearized = d.linearized;
   cloudData.clustered = d.clustered;
@@ -2515,6 +2684,8 @@ function makePoints(pos, col) {
 
 function clearScene() {
   clearLinRows();
+  clearPointHoverRing();
+  _hoverRingScene = null;
   if (rawPoints) { scene.remove(rawPoints); rawPoints = null; }
   if (mainPoints) { scene.remove(mainPoints); mainPoints = null; }
   Object.values(isolatedMeshes).forEach(m => scene.remove(m));
@@ -3090,7 +3261,7 @@ function applyDisplayColors() {
   fullLinColors = new Float32Array(newColors);
   linBaseColors = new Float32Array(newColors);
 
-  // Update mainPoints if visible
+  // Update mainPoints colors (but only write to its buffer — visibility is unchanged)
   if (mainPoints) {
     mainPoints.geometry.attributes.color.array.set(newColors);
     mainPoints.geometry.attributes.color.needsUpdate = true;
@@ -3101,6 +3272,39 @@ function applyDisplayColors() {
     // Rebuild row colors from the global color arrays
     // Each row contains a subset of points — need to re-extract colors
     rebuildRowColors();
+  }
+
+  // If a cluster is currently isolated, re-apply isolation dimming on top of the new colors
+  // so the view doesn't revert to showing the full cloud
+  if (activeIsolatedId !== null) {
+    if (isRowMode && linRows.length > 0) {
+      linRows.forEach(r => {
+        const hasCluster = r.clusterIds.includes(activeIsolatedId);
+        const colAttr = r.points.geometry.attributes.color;
+        const arr = colAttr.array;
+        const n = r.labels.length;
+        if (hasCluster) {
+          for (let i = 0; i < n; i++) {
+            if (r.labels[i] !== activeIsolatedId) {
+              arr[i*3] = 0.0; arr[i*3+1] = 0.0; arr[i*3+2] = 0.0;
+            }
+            // cluster points already have the correct display-mode color from rebuildRowColors
+          }
+        }
+        colAttr.needsUpdate = true;
+      });
+    } else if (mainPoints && linLabels && linBaseColors) {
+      // Single-scene mode: re-apply isolation filter on mainPoints
+      const colAttr = mainPoints.geometry.attributes.color;
+      const arr = colAttr.array;
+      const n = linLabels.length;
+      for (let i = 0; i < n; i++) {
+        if (linLabels[i] !== activeIsolatedId) {
+          arr[i*3] = 0.0; arr[i*3+1] = 0.0; arr[i*3+2] = 0.0;
+        }
+      }
+      colAttr.needsUpdate = true;
+    }
   }
 }
 
@@ -3331,6 +3535,11 @@ function animate() {
 
   updateOrientCube();
   if (cRenderer && cScene && cCamera) cRenderer.render(cScene, cCamera);
+  // Pulse the hover ring continuously
+  if (_hoverRing && _hoverRing.visible) {
+    const t = (performance.now() % 1200) / 1200;
+    _hoverRing.material.opacity = 0.55 + 0.45 * Math.sin(t * Math.PI * 2);
+  }
   fCnt++;
   const now = performance.now();
   if (now - fTime >= 1000) { document.getElementById("fpsEl").textContent = `FPS: ${fCnt}`; fCnt = 0; fTime = now; }

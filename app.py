@@ -806,6 +806,6 @@ def upload_annotation():
 if __name__ == '__main__':
     print("\n" + "="*60)
     print("  Point Cloud Viewer — Clustering + Linearization + Click Export")
-    print("  http://localhost:5000")
+    print("  http://localhost:8080")
     print("="*60 + "\n")
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0', port=8080)
