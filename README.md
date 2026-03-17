@@ -73,51 +73,6 @@ Open **http://localhost:5000** in your browser.
 
 ---
 
-## Usage Guide
-
-### 1. Upload a Point Cloud
-
-- **File → Open** or click the 📂 toolbar button
-- Drag-and-drop or browse for a point cloud file
-- Optionally attach annotation PLY files (multiple supported)
-- Click **Upload & Process**
-
-### 2. Cluster & Linearize
-
-- Adjust the **eps Parameter** in the right panel (lower = more clusters)
-- Click **Cluster & Linearize** (or **Re-Cluster** to recompute)
-- The main view shows clusters spread horizontally in rows
-- The clustered view (top-right) shows original spatial arrangement with per-cluster colors
-
-### 3. Inspect Clusters
-
-- **Hover** a cluster in the Cluster Properties panel → highlights in main view
-- **Click** a cluster → isolates it, zooms in, filters annotations and table
-- **✕ Show All** to return to full view
-- **Scroll wheel** zooms individual rows independently
-
-### 4. Measure DBH
-
-1. Isolate a cluster (click it in the right panel)
-2. **Tools → DBH Calculation** opens the slice tool
-3. Click **"Show 1.5m Reference Plane"** to see the terrain-following black plane
-4. Adjust the **slice height** with the slider (red plane moves)
-5. Click **"✂ Slice & Top View"**:
-   - Points above the slice and all ground are removed
-   - Only trunk cross-sections remain (using annotation positions)
-   - Camera switches to top-down view
-6. **Double-click** a trunk hole to place a fitting circle
-7. Use **+/−** keys to resize, **arrow keys** to move, **Enter** to lock
-8. **Double-click** the next trunk to place another circle (previous stays)
-9. Click **✔** to save all DBH measurements to the table
-
-### 5. Export Data
-
-- **File → Export Clicks CSV** or 💾 toolbar button
-- CSV includes: original XYZ, cluster ID, camera state, marker properties
-- Click data auto-saves to server and restores on reload
-
----
 
 ## Keyboard Shortcuts
 
