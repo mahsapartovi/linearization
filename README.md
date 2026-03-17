@@ -1,6 +1,6 @@
 # 3D Point Cloud Viewer 
 
-A web-based interactive tool for visualizing, clustering, linearizing, and annotating 3D point cloud data from terrestrial laser scanning (TLS) of forests. Built with Flask (Python) and Three.js (JavaScript).
+A web-based interactive tool for visualizing, clustering, linearizing, and annotating 3D point cloud data for forests. Built with Flask (Python) and Three.js (JavaScript).
 
 ![Point Cloud Viewer](https://img.shields.io/badge/Flask-Backend-blue) ![Three.js]
 
