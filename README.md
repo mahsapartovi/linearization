@@ -6,59 +6,6 @@ A web-based interactive tool for visualizing, clustering, linearizing, and annot
 
 ---
 
-## Features
-
-### Point Cloud Visualization
-- Upload and render point clouds with up to **5 million points** per view
-- Lit point-sphere shader rendering with adjustable point size and optional lighting
-- Multiple background modes (gradient, black, white)
-- Coordinate readout on mouse hover
-- Orientation cube for spatial reference
-- Resizable panels (left sidebar, right panel, bottom info panel)
-
-### Density-Based Clustering & Linearization
-- Automatic density-based spatial clustering (adjustable `eps` parameter)
-- Linearized view: clusters are spread along the X-axis for side-by-side comparison
-- Multi-row layout: clusters auto-pack into scrollable rows sized to fill the viewport
-- Adjustable overlap fraction between adjacent clusters
-- Clustered view in a separate panel with per-cluster coloring
-
-### Cluster Interaction
-- Hover a cluster in the right panel → highlights it in the main view
-- Click a cluster → isolates it (hides all others)
-- Per-cluster zoom and camera control
-- Normal and curvature visualization (PCA-based, auto-computed)
-
-### Annotation Support
-- Upload annotation/ground-truth PLY files alongside the main point cloud
-- Each annotation file represents one tree with semantic and instance labels
-- Pink sprite markers at 1.5m trunk height (DBH reference)
-- Per-file visibility toggle in the DB Tree panel
-- Annotation markers filter by isolated cluster
-
-### DBH (Diameter at Breast Height) Measurement
-- **Ground surface estimation**: 20×20 grid with 5th-percentile Z, bilinear interpolation, and smoothing
-- **Reference plane**: black terrain-following plane at 1.5m above ground
-- **Adjustable slice plane**: red plane with height slider
-- **Annotation-based slicing**: keeps only trunk points near known tree positions, removes all ground
-- **Top-down view** for trunk cross-section inspection
-- **Circle fitting**: place, move (arrow keys), resize (+/−), lock (Enter)
-- **Multi-circle workflow**: fit multiple trunks before saving all at once (✔)
-- DBH diameter recorded in the Click Log table
-
-### Click Log & Data Export
-- Double-click any point to log it with original XYZ coordinates
-- Annotation entries sorted by cluster (descending)
-- Table filters to show only the active cluster's entries
-- Right-click context menu: Edit, Add row, Move to bottom
-- Drag-and-drop row reordering
-- Editable cluster column (contenteditable cells)
-- Mouse hover over trees highlights the associated row in the table
-- Export all clicks to CSV with full metadata
-- Auto-save clicks to server (restored on reload)
-
----
-
 ## Project Structure
 
 ```
