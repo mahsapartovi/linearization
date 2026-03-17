@@ -83,6 +83,8 @@ let curvatureColorsData = null; // Float32Array — curvature color per lineariz
 let whiteColorsData = null;    // Float32Array — default white colors
 let rawWhiteColorsData = null; // Float32Array — white colors for raw cloud display
 let normalsComputed = false;
+let whiteTintColor = [1.0, 1.0, 1.0]; // RGB tint applied in white display mode
+let currentBgMode = 'gradient';       // persists across cloud reloads
 
 // Annotation state
 let annotationPositions = null;  // array of {x,y,z,instance,file,...} in linearized space
@@ -213,7 +215,7 @@ function buildRowScenes() {
     cx /= count; cy /= count; cz /= count;
     for (let j = 0; j < count; j++) { pos[j*3] -= cx; pos[j*3+1] -= cy; pos[j*3+2] -= cz; }
 
-    const rowScene = new THREE.Scene(); setBg("gradient", rowScene);
+    const rowScene = new THREE.Scene(); setBg(currentBgMode, rowScene);
     rowScene.add(new THREE.AmbientLight(0xffffff, 0.6));
     const dl = new THREE.DirectionalLight(0xffffff, 0.8); dl.position.set(10, 20, 10); rowScene.add(dl);
     const rowCam = new THREE.PerspectiveCamera(60, screenW / Math.max(rowH, 1), 0.001, 5000);
@@ -286,7 +288,7 @@ function init() {
 
 function initMainViewport() {
   const c = document.getElementById("viewportContainer");
-  scene = new THREE.Scene(); setBg("gradient", scene);
+  scene = new THREE.Scene(); setBg(currentBgMode, scene);
   camera = new THREE.PerspectiveCamera(60, c.clientWidth/c.clientHeight, 0.001, 5000);
   camera.position.set(0,5,15); camera.lookAt(0,0,0);
   renderer = new THREE.WebGLRenderer({antialias:true, preserveDrawingBuffer:true});
@@ -301,7 +303,7 @@ function initMainViewport() {
 
 function initClusterViewport() {
   const c = document.getElementById("clusterViewContainer"); if (!c) return;
-  cScene = new THREE.Scene(); setBg("gradient", cScene);
+  cScene = new THREE.Scene(); setBg(currentBgMode, cScene);
   const w = c.clientWidth||296, h = c.clientHeight||200;
   cCamera = new THREE.PerspectiveCamera(60, w/Math.max(h,1), 0.001, 5000);
   cCamera.position.set(0,5,15); cCamera.lookAt(0,0,0);
@@ -2066,9 +2068,8 @@ function loadCloud(data) {
   clearScene();
   cloudData = data; cloudId = data.id;
 
-  // Reset display mode to white
-  displayMode = 'white';
-  updateColorScaleBar('white');
+  // Keep the user's current display mode — only reset if normals won't be available
+  updateColorScaleBar(displayMode);
 
   // Linearized view — decode base64 arrays
   fullLinPositions = decodeArr(data.linearized.positions, 'float32');
@@ -2086,11 +2087,14 @@ function loadCloud(data) {
     normalsComputed = true;
   } else {
     normalColorsData = null; curvatureColorsData = null; normalsComputed = false;
+    if (displayMode !== 'white') { displayMode = 'white'; }
   }
   updateDisplayMenuChecks();
 
   mainPoints = makePoints(fullLinPositions, fullLinColors);
   scene.add(mainPoints);
+  // Apply the current display mode and point tint to the freshly loaded cloud
+  applyDisplayColors();
 
   // Clustered view — decode base64 arrays
   clsPositions = decodeArr(data.clustered.positions, 'float32');
@@ -2167,6 +2171,8 @@ function loadRawCloud(data) {
 
   rawPoints = makePoints(positions, colors);
   scene.add(rawPoints);
+  // Apply whiteTintColor to the freshly loaded raw cloud
+  applyDisplayColors();
   fitCamera(rawPoints, camera, mainVP);
 
   // Kick off background normals computation — available once done
@@ -2570,8 +2576,9 @@ function reloadViews(d) {
 
   mainPoints = makePoints(fullLinPositions, fullLinColors);
   scene.add(mainPoints);
-
-  // Rebuild clustered view
+  // Re-apply current display mode and point tint after rebuild
+  applyDisplayColors();
+  updateDisplayMenuChecks();
   clsPositions = decodeArr(d.clustered.positions, 'float32');
   clsColors = decodeArr(d.clustered.colors, 'float32');
   if (d.clustered.original_xyz) clsOrigXYZ = decodeArr(d.clustered.original_xyz, 'float64');
@@ -3193,9 +3200,9 @@ function setupMenus() {
   document.getElementById("menuCloseAll").addEventListener("click", () => window._clearAll());
   document.getElementById("menuToggleGrid").addEventListener("click", toggleGrid);
   document.getElementById("menuToggleAxes").addEventListener("click", toggleAxes);
-  document.getElementById("menuBgBlack").addEventListener("click", () => { setBg("black", scene); setBg("black", cScene); linRows.forEach(r => setBg("black", r.scene)); });
-  document.getElementById("menuBgGradient").addEventListener("click", () => { setBg("gradient", scene); setBg("gradient", cScene); linRows.forEach(r => setBg("gradient", r.scene)); });
-  document.getElementById("menuBgWhite").addEventListener("click", () => { setBg("white", scene); setBg("white", cScene); linRows.forEach(r => setBg("white", r.scene)); });
+  document.getElementById("menuBgBlack").addEventListener("click", () => { currentBgMode="black"; setBg("black", scene); setBg("black", cScene); linRows.forEach(r => setBg("black", r.scene)); });
+  document.getElementById("menuBgGradient").addEventListener("click", () => { currentBgMode="gradient"; setBg("gradient", scene); setBg("gradient", cScene); linRows.forEach(r => setBg("gradient", r.scene)); });
+  document.getElementById("menuBgWhite").addEventListener("click", () => { currentBgMode="white"; setBg("white", scene); setBg("white", cScene); linRows.forEach(r => setBg("white", r.scene)); });
   document.querySelectorAll("[data-view]").forEach(el => el.addEventListener("click", () => setView(el.dataset.view)));
   document.getElementById("menuShortcuts").addEventListener("click", () => document.getElementById("shortcutsModal").classList.add("show"));
   document.getElementById("menuClearClicks").addEventListener("click", clearAllClicks);
@@ -3287,7 +3294,14 @@ function applyDisplayColors() {
     } else if (displayMode === 'curvature' && curvatureColorsData) {
       newColors = curvatureColorsData;
     } else {
-      newColors = rawWhiteColorsData || new Float32Array(nPts * 3).fill(1.0);
+      // Apply white tint: multiply base colors by the chosen tint
+      const base = rawWhiteColorsData || new Float32Array(nPts * 3).fill(1.0);
+      newColors = new Float32Array(nPts * 3);
+      for (let i = 0; i < nPts; i++) {
+        newColors[i*3]   = base[i*3]   * whiteTintColor[0];
+        newColors[i*3+1] = base[i*3+1] * whiteTintColor[1];
+        newColors[i*3+2] = base[i*3+2] * whiteTintColor[2];
+      }
     }
     rawPoints.geometry.attributes.color.array.set(newColors);
     rawPoints.geometry.attributes.color.needsUpdate = true;
@@ -3303,9 +3317,13 @@ function applyDisplayColors() {
   } else if (displayMode === 'curvature' && curvatureColorsData) {
     newColors = curvatureColorsData;
   } else {
-    // White — default
+    // White with optional tint
     newColors = new Float32Array(nPts * 3);
-    for (let i = 0; i < nPts * 3; i++) newColors[i] = 1.0;
+    for (let i = 0; i < nPts; i++) {
+      newColors[i*3]   = whiteTintColor[0];
+      newColors[i*3+1] = whiteTintColor[1];
+      newColors[i*3+2] = whiteTintColor[2];
+    }
   }
 
   // Update global color arrays
@@ -3427,6 +3445,15 @@ function setupToolbar() {
   //document.getElementById("tbShot").addEventListener("click", screenshot);
   document.getElementById("tbLighting").addEventListener("click", toggleLighting);
   document.getElementById("ptSlider").addEventListener("input", e => setPtSize(parseFloat(e.target.value)));
+  document.getElementById("ptColorPicker").addEventListener("input", e => {
+    const hex = e.target.value;
+    whiteTintColor = [
+      parseInt(hex.slice(1,3),16)/255,
+      parseInt(hex.slice(3,5),16)/255,
+      parseInt(hex.slice(5,7),16)/255,
+    ];
+    if (displayMode === 'white') applyDisplayColors();
+  });
   // Display mode menu items
   document.getElementById("menuDisplayWhite").addEventListener("click", () => setDisplayMode('white'));
   document.getElementById("menuDisplayNormal").addEventListener("click", () => setDisplayMode('normal'));
@@ -3448,10 +3475,132 @@ function onKeyDown(e) {
   }
 }
 
+// Render a scene into an offscreen RenderTarget and return a flipped ImageData.
+// Does NOT touch the live renderer size — safe to call at any time.
+function _renderToImageData(ren, renderFn, w, h) {
+  const rt = new THREE.WebGLRenderTarget(w, h, {
+    minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+    format: THREE.RGBAFormat, type: THREE.UnsignedByteType,
+    antialias: true,
+  });
+  const savedRT = ren.getRenderTarget();
+  const savedVP = new THREE.Vector4(); ren.getViewport(savedVP);
+  const savedScissor = new THREE.Vector4(); ren.getScissor(savedScissor);
+  const savedScissorTest = ren.getScissorTest();
+  const savedAutoClear = ren.autoClear;
+
+  ren.setRenderTarget(rt);
+  ren.setViewport(0, 0, w, h);
+  ren.setScissorTest(false);
+  ren.autoClear = true;
+  ren.setClearColor(0x0a0a12, 1);
+  ren.clear();
+
+  renderFn(ren, w, h);
+
+  // Read raw RGBA pixels
+  const buf = new Uint8Array(w * h * 4);
+  ren.readRenderTargetPixels(rt, 0, 0, w, h, buf);
+
+  // Restore renderer state
+  ren.setRenderTarget(savedRT);
+  ren.setViewport(savedVP.x, savedVP.y, savedVP.z, savedVP.w);
+  ren.setScissor(savedScissor.x, savedScissor.y, savedScissor.z, savedScissor.w);
+  ren.setScissorTest(savedScissorTest);
+  ren.autoClear = savedAutoClear;
+  rt.dispose();
+
+  // WebGL reads pixels bottom-up — flip vertically for canvas (top-down)
+  const flipped = new Uint8ClampedArray(w * h * 4);
+  const rowBytes = w * 4;
+  for (let row = 0; row < h; row++) {
+    const src = (h - 1 - row) * rowBytes;
+    const dst = row * rowBytes;
+    flipped.set(buf.subarray(src, src + rowBytes), dst);
+  }
+  return new ImageData(flipped, w, h);
+}
+
 function screenshot() {
-  renderer.render(scene, camera);
-  const a = document.createElement("a"); a.href = renderer.domElement.toDataURL("image/png");
-  a.download = "pointcloud.png"; a.click(); status("Screenshot saved");
+  const SCALE = 4; // render at 4× the current CSS pixel size
+
+  const mainCanvas = renderer.domElement;
+  const clsCanvas  = cRenderer ? cRenderer.domElement : null;
+
+  const mainW = Math.round(mainCanvas.clientWidth  * SCALE);
+  const mainH = Math.round(mainCanvas.clientHeight * SCALE);
+  const clsW  = clsCanvas ? Math.round(clsCanvas.clientWidth  * SCALE) : 0;
+  const clsH  = clsCanvas ? Math.round(clsCanvas.clientHeight * SCALE) : 0;
+
+  // ── 1. Render main / row view into offscreen target ──────────
+  const mainData = _renderToImageData(renderer, (ren, w, h) => {
+    if (isRowMode && linRows.length > 0) {
+      const nR = linRows.length;
+      // Scale row heights proportionally to the hi-res output height
+      const displayTotalH = linRows.length * effectiveRowHeight() + (linRows.length - 1) * ROW_GAP;
+      const scaleY = h / displayTotalH;
+      const rowHPx  = Math.round(effectiveRowHeight() * scaleY);
+      const gapPx   = Math.round(ROW_GAP * scaleY);
+      ren.setScissorTest(true);
+      ren.autoClear = false;
+      for (let i = 0; i < nR; i++) {
+        const y = h - ((i + 1) * rowHPx + i * gapPx);
+        ren.setViewport(0, Math.round(y), w, rowHPx);
+        ren.setScissor(0,  Math.round(y), w, rowHPx);
+        // Adjust camera aspect for hi-res width
+        const savedAspect = linRows[i].camera.aspect;
+        linRows[i].camera.aspect = w / Math.max(rowHPx, 1);
+        linRows[i].camera.updateProjectionMatrix();
+        ren.render(linRows[i].scene, linRows[i].camera);
+        linRows[i].camera.aspect = savedAspect;
+        linRows[i].camera.updateProjectionMatrix();
+      }
+      ren.setScissorTest(false);
+      ren.autoClear = true;
+    } else {
+      ren.setViewport(0, 0, w, h);
+      // Adjust camera aspect for hi-res canvas
+      const savedAspect = camera.aspect;
+      camera.aspect = w / Math.max(h, 1);
+      camera.updateProjectionMatrix();
+      ren.render(scene, camera);
+      camera.aspect = savedAspect;
+      camera.updateProjectionMatrix();
+    }
+  }, mainW, mainH);
+
+  // ── 2. Render cluster view into offscreen target ──────────────
+  let clsData = null;
+  if (cRenderer && cScene && cCamera && clsW > 0 && clsH > 0) {
+    clsData = _renderToImageData(cRenderer, (ren, w, h) => {
+      const savedAspect = cCamera.aspect;
+      cCamera.aspect = w / Math.max(h, 1);
+      cCamera.updateProjectionMatrix();
+      ren.setViewport(0, 0, w, h);
+      ren.render(cScene, cCamera);
+      cCamera.aspect = savedAspect;
+      cCamera.updateProjectionMatrix();
+    }, clsW, clsH);
+  }
+
+  // ── 3. Composite onto a 2D canvas and download ───────────────
+  const totalW = mainW + (clsData ? clsW : 0);
+  const totalH = Math.max(mainH, clsData ? clsH : 0);
+
+  const out = document.createElement('canvas');
+  out.width = totalW; out.height = totalH;
+  const ctx = out.getContext('2d');
+  ctx.fillStyle = '#0a0a12';
+  ctx.fillRect(0, 0, totalW, totalH);
+  ctx.putImageData(mainData, 0, 0);
+  if (clsData) ctx.putImageData(clsData, mainW, 0);
+
+  const a = document.createElement('a');
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  a.download = `pointcloud_${ts}.png`;
+  a.href = out.toDataURL('image/png');
+  a.click();
+  status('High-resolution screenshot saved');
 }
 
 

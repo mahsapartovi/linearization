@@ -66,9 +66,15 @@
   <div class="ts"></div>
   <button class="tb tb-export" id="tbExportCSV" title="Export Clicks CSV">💾</button>
   <div class="ts"></div>
-  <label class="tl">Size:</label>
-  <input type="range" id="ptSlider" min="0.5" max="10" step="0.1" value="2.0" class="tslider"/>
+  <label class="tl">Points:</label>
+  <input type="color" id="ptColorPicker" value="#ffffff" title="Point color (white display mode)" class="tcolor"/>
+  <input type="range" id="ptSlider" min="0.5" max="10" step="0.1" value="2.0" class="tslider" title="Point size"/>
   <span id="ptVal" class="tv">2.0</span>
+  <div class="ts"></div>
+  <label class="tl">Annotations:</label>
+  <input type="color" id="markerColor" value="#ff0000" title="Marker color" class="tcolor"/>
+  <input type="range" id="markerSizeSlider" min="0.3" max="4" step="0.1" value="1.0" class="tslider" title="Marker size"/>
+  <span id="markerSizeVal" class="tv">1.0</span>
 </div>
 
 <!-- MAIN LAYOUT -->
@@ -164,20 +170,12 @@
         <div class="param-row"><label>eps Parameter:</label><input type="number" id="pEpsParam" value="0.6" step="0.1" min="0.05" max="10"/></div>
         <button class="action-btn" id="btnRecluster">Cluster & Linearize</button>
         <div class="param-divider"></div>
-        <div class="param-divider"></div>
         <div class="param-row"><label>Row Height:</label>
           <input type="range" id="pRowHeight" min="100" max="900" step="10" value="100" style="flex:1"/>
           <span id="rowHeightVal" style="min-width:32px;text-align:right;font-size:10px;">Auto</span>
         </div>
         <div class="param-row"><label>Overlap Fraction:</label><input type="number" id="pOverlap" value="0.15" step="0.05" min="-0.5" max="0.5"/></div>
         <button class="action-btn overlap-btn" id="btnApplyOverlap">Apply Overlap </button>
-        <div class="param-divider"></div>
-        <div class="param-section-label">Marker Settings</div>
-        <div class="param-row"><label>Marker Color:</label><input type="color" id="markerColor" value="#ff0000" title="Marker color"/></div>
-        <div class="param-row"><label>Marker Size:</label>
-          <input type="range" id="markerSizeSlider" min="0.3" max="4" step="0.1" value="1.0" style="flex:1"/>
-          <span id="markerSizeVal" style="min-width:28px;text-align:right;">1.0</span>
-          </div>
         </div>
       </div>
     </div>
