@@ -158,8 +158,3 @@ Access via **Display** menu:
 
 Requires WebGL support. Performance depends on GPU — large point clouds (>3M points) benefit from a dedicated graphics card.
 
----
-
-## License
-
-MIT License — see [LICENSE](LICENSE) for details.
