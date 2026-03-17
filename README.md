@@ -1,8 +1,8 @@
 # 3D Point Cloud Viewer & DBH Measurement Tool
 
-A web-based interactive tool for visualizing, clustering, linearizing, and annotating 3D point cloud data from terrestrial laser scanning (TLS) of forests. Built with Flask (Python) and Three.js (JavaScript).
+A web-based interactive tool for visualizing, clustering, linearizing, and annotating 3D point cloud data from forests. Built with Flask (Python) and Three.js (JavaScript).
 
-![Point Cloud Viewer](https://img.shields.io/badge/Flask-Backend-blue) ![Three.js](https://img.shields.io/badge/Three.js-3D_Rendering-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
+![Point Cloud Viewer](https://img.shields.io/badge/Flask-Backend-blue) ![Three.js]
 
 ---
 
