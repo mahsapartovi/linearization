@@ -81,6 +81,7 @@ let displayMode = 'white';     // 'white' | 'normal' | 'curvature'
 let normalColorsData = null;   // Float32Array — normal RGB per linearized point
 let curvatureColorsData = null; // Float32Array — curvature color per linearized point
 let whiteColorsData = null;    // Float32Array — default white colors
+let rawWhiteColorsData = null; // Float32Array — white colors for raw cloud display
 let normalsComputed = false;
 
 // Annotation state
@@ -2151,12 +2152,25 @@ function loadRawCloud(data) {
   cloudData = data; cloudId = data.id;
   isRawMode = true;
 
+  // Reset display mode
+  displayMode = 'white';
+  updateColorScaleBar('white');
+
   const positions = decodeArr(data.positions, 'float32');
   const colors = decodeArr(data.colors, 'float32');
+
+  // Store raw color data for display-mode switching
+  rawWhiteColorsData = new Float32Array(colors);
+  // Normals are computed async after load — reset state for now
+  normalColorsData = null; curvatureColorsData = null; normalsComputed = false;
+  updateDisplayMenuChecks();
 
   rawPoints = makePoints(positions, colors);
   scene.add(rawPoints);
   fitCamera(rawPoints, camera, mainVP);
+
+  // Kick off background normals computation — available once done
+  _fetchRawNormals();
 
   // Store annotation info for later use after clustering
   if (data.annotation && data.annotation.trees) {
@@ -2470,11 +2484,11 @@ function setupRecluster() {
   document.getElementById("btnRecluster").addEventListener("click", () => {
     if (!cloudId) { status("No cloud loaded"); return; }
     const gr = parseFloat(document.getElementById("pEpsParam").value) || 0.6;
-    const ov = parseFloat(document.getElementById("pOverlap").value) || 0.15;
+    const ov = parseFloat(document.getElementById("pOverlap").value);
     lastEpsParam = gr;
     showLoading(isRawMode ? "Clustering & linearizing…" : "Re-clustering…");
     fetch("/recluster", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cloud_id: cloudId, grid_resolution: gr, overlap: ov }) })
+      body: JSON.stringify({ cloud_id: cloudId, grid_resolution: gr, overlap: isNaN(ov) ? 0.15 : ov }) })
     .then(r => r.json()).then(d => {
       hideLoading();
       if (d.error) { status("Error: " + d.error); return; }
@@ -2503,10 +2517,10 @@ function setupRecluster() {
   document.getElementById("btnApplyOverlap").addEventListener("click", () => {
     if (!cloudId) { status("No cloud loaded"); return; }
     if (isRawMode) { status("Cluster first before adjusting overlap."); return; }
-    const ov = parseFloat(document.getElementById("pOverlap").value) || 0.15;
+    const ov = parseFloat(document.getElementById("pOverlap").value);
     status("Applying overlap…");
     fetch("/relinearize", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cloud_id: cloudId, overlap: ov }) })
+      body: JSON.stringify({ cloud_id: cloudId, overlap: isNaN(ov) ? 0.15 : ov }) })
     .then(r => r.json()).then(d => {
       if (d.error) { status("Error: " + d.error); return; }
       reloadViews(d);
@@ -2697,7 +2711,7 @@ function clearScene() {
   isRawMode = false;
   originalXYZ = null; clsOrigXYZ = null;
   fullLinPositions = null; fullLinColors = null; linBaseColors = null;
-  whiteColorsData = null; normalColorsData = null; curvatureColorsData = null; normalsComputed = false;
+  whiteColorsData = null; rawWhiteColorsData = null; normalColorsData = null; curvatureColorsData = null; normalsComputed = false;
   linLabels = null; clsLabels = null; clsPositions = null; clsColors = null;
   hoveredCluster = -1;
   clearAnnotationMarkers();
@@ -3193,6 +3207,25 @@ function setupMenus() {
 // NORMAL / CURVATURE DISPLAY
 // ═══════════════════════════════════════════════════════════
 
+function _fetchRawNormals() {
+  // Background fetch of normals for raw cloud — non-blocking, enables display modes when ready
+  if (!cloudId) return;
+  const cid = cloudId;
+  fetch("/compute_normals", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cloud_id: cid }) })
+  .then(r => r.json()).then(data => {
+    // Make sure the same cloud is still loaded
+    if (cloudId !== cid || !isRawMode) return;
+    if (data.error) return;
+    normalColorsData = decodeArr(data.normal_colors, 'float32');
+    curvatureColorsData = decodeArr(data.curvature_colors, 'float32');
+    normalsComputed = true;
+    updateDisplayMenuChecks();
+    // If user already switched mode, apply it now
+    if (displayMode !== 'white') applyDisplayColors();
+  }).catch(() => {});
+}
+
 function computeNormals() {
   // Fallback: manually request normal computation if not auto-done
   if (!cloudId) { status("No cloud loaded"); return; }
@@ -3224,7 +3257,9 @@ function fetchLinearizedDisplayColors() {
 
 function setDisplayMode(mode) {
   if (mode !== 'white' && !normalColorsData) {
-    status("Normals not yet computed — will be available after clustering.");
+    status(isRawMode
+      ? "Normals not available for this file."
+      : "Normals not yet computed — will be available after clustering.");
     return;
   }
   displayMode = mode;
@@ -3243,6 +3278,22 @@ function updateDisplayMenuChecks() {
 }
 
 function applyDisplayColors() {
+  // Raw mode: update rawPoints directly, no rows/isolation to worry about
+  if (isRawMode && rawPoints) {
+    const nPts = rawPoints.geometry.attributes.position.count;
+    let newColors;
+    if (displayMode === 'normal' && normalColorsData) {
+      newColors = normalColorsData;
+    } else if (displayMode === 'curvature' && curvatureColorsData) {
+      newColors = curvatureColorsData;
+    } else {
+      newColors = rawWhiteColorsData || new Float32Array(nPts * 3).fill(1.0);
+    }
+    rawPoints.geometry.attributes.color.array.set(newColors);
+    rawPoints.geometry.attributes.color.needsUpdate = true;
+    return;
+  }
+
   if (!fullLinPositions) return;
   const nPts = fullLinPositions.length / 3;
   let newColors;
