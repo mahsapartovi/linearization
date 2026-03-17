@@ -1,4 +1,4 @@
-# 3D Point Cloud Viewer & DBH Measurement Tool
+# 3D Point Cloud Viewer tool
 
 A web-based interactive tool for visualizing, clustering, linearizing, and annotating 3D point cloud data from forests. Built with Flask (Python) and Three.js (JavaScript).
 
