@@ -91,6 +91,8 @@ let annotationPositions = null;  // array of {x,y,z,instance,file,...} in linear
 let annotationMarkers = [];      // THREE.Mesh objects for pink circles
 let annotationVisible = true;    // global toggle
 let annotationFileVisibility = {}; // {filename: true/false}
+let dbhCylinders = [];           // THREE.Mesh cylinders drawn at DBH radius
+let dbhCylindersVisible = false; // toolbar toggle state
 let linInstanceLabels = null;
 
 // Multi-row linearized state
@@ -253,8 +255,8 @@ function updateRowLabels() {
 
 let fCnt = 0, fTime = performance.now();
 
-// Track last known grid_res for detecting real re-cluster need
-let lastGridRes = 0.6;
+// Track last known Eps_Param for detecting real re-cluster need
+let lastEpsParam = 0.6;
 
 
 // ═══════════════════════════════════════════════════════════
@@ -275,7 +277,6 @@ function init() {
   setupClickExport();
   setupDbh();
   setupContextMenuActions();
-  setupCylinderContextMenu();
   window.addEventListener("resize", onResize);
   document.getElementById("clearIsolation").addEventListener("click", clearIsolation);
   animate();
@@ -414,7 +415,7 @@ function setupMainControls() {
       if (ri && !ri.row.vp.mouseMoved) onRowDoubleClick(e, ri);
     } else if(!mainVP.mouseMoved) onMainDoubleClick(e);
   });
-  el.addEventListener("contextmenu", e=>{e.preventDefault(); onCylinderRightClick(e);});
+  el.addEventListener("contextmenu", e=>e.preventDefault());
   document.addEventListener("keydown", onKeyDown);
 }
 
@@ -1174,36 +1175,10 @@ function exportClicksCSV() {
   status(`Exported ${clickedPoints.length} clicks to CSV (with original XYZ).`);
 }
 
-function exportAnnotationsCSV() {
-  if (!annotationPositions || !annotationPositions.length) {
-    alert("No annotation data to export. Upload annotation PLY files first.");
-    return;
-  }
-  const headers = ['TreeID', 'X', 'Y', 'Z', 'Cluster', 'DBH'];
-  const rows = [headers.join(',')];
-  annotationPositions.forEach(ann => {
-    const treeId = ann.instance !== undefined ? ann.instance : '—';
-    const x = Number(ann.orig_x).toFixed(4);
-    const y = Number(ann.orig_y).toFixed(4);
-    const z = Number(ann.orig_z).toFixed(4);
-    const cluster = ann.cluster !== undefined && ann.cluster >= 0 ? ann.cluster : '';
-    const dbh = ann._dbh || '';
-    rows.push([treeId, x, y, z, cluster, dbh].join(','));
-  });
-  const blob = new Blob([rows.join('\n')], {type: 'text/csv;charset=utf-8;'});
-  const url = URL.createObjectURL(blob), link = document.createElement('a');
-  const name = cloudData ? cloudData.name.replace(/\.[^.]+$/, '') : 'annotations';
-  link.href = url; link.download = `${name}_annotations.csv`;
-  document.body.appendChild(link); link.click(); document.body.removeChild(link);
-  URL.revokeObjectURL(url);
-  status(`Exported ${annotationPositions.length} annotations to CSV (TreeID, XYZ, Cluster, DBH).`);
-}
-
 function setupClickExport() {
   document.getElementById("tbExportCSV").addEventListener("click", exportClicksCSV);
   document.getElementById("menuExportCSV").addEventListener("click", exportClicksCSV);
   document.getElementById("menuToolsExport").addEventListener("click", exportClicksCSV);
-  document.getElementById("menuExportAnnotations").addEventListener("click", exportAnnotationsCSV);
 
   // Marker COLOR change — update ALL existing markers
   document.getElementById("markerColor").addEventListener("input", e => {
@@ -1220,6 +1195,11 @@ function setupClickExport() {
     // Update stored click data
     clickedPoints.forEach(c => { c.markerColor = newColorHex; });
     if (clickedPoints.length > 0) autoSaveClicks();
+    // Sync DB tree annotation dot color and rebuild 3D annotation sprites
+    if (annotationPositions && annotationPositions.length > 0) buildAnnotationMarkers();
+    updateDBTree();
+    // Rebuild DBH cylinders with new color
+    if (dbhCylinders.length > 0) buildDbhCylinders();
   });
 
   // Marker SIZE change — update ALL existing markers
@@ -1245,11 +1225,13 @@ function setupClickExport() {
     // Update stored click data too
     clickedPoints.forEach(c => { c.markerSize = newSize; });
     if (clickedPoints.length > 0) autoSaveClicks();
+    // Also rescale annotation tree markers
+    const annScale = 0.8 * newSize;
+    annotationMarkers.forEach(m => { if (m) m.scale.set(annScale, annScale, annScale); });
   });
 }
 window.getClickedPoints=()=>[...clickedPoints];
 window.exportClicksCSV=exportClicksCSV;
-window.exportAnnotationsCSV=exportAnnotationsCSV;
 
 // ═══════════════════════════════════════════════════════════
 // CLICK LOG — bottom info panel
@@ -1305,7 +1287,8 @@ function addAnnotationLogEntries(annPositions) {
     tr.dataset.rowType = 'ann';
     tr.dataset.cluster = ann.cluster !== undefined ? ann.cluster : -1;
     const clStr = ann.cluster !== undefined && ann.cluster >= 0 ? ann.cluster : '—';
-    tr.innerHTML = `<td>A${i+1}</td><td>${Number(ann.orig_x).toFixed(3)}</td><td>${Number(ann.orig_y).toFixed(3)}</td><td>${Number(ann.orig_z).toFixed(3)}</td><td class="editable" contenteditable="true" data-field="cluster">${clStr}</td><td class="dbh-cell">${ann._dbh || '—'}</td><td>Annotation</td>`;
+    const dbhVal = ann._dbh != null ? ann._dbh : (ann.dbh != null ? Number(ann.dbh).toFixed(4) : '—');
+    tr.innerHTML = `<td>A${i+1}</td><td>${Number(ann.orig_x).toFixed(3)}</td><td>${Number(ann.orig_y).toFixed(3)}</td><td>${Number(ann.orig_z).toFixed(3)}</td><td class="editable" contenteditable="true" data-field="cluster">${clStr}</td><td class="dbh-cell">${dbhVal}</td><td>Annotation</td>`;
     setupRowDragDrop(tr);
     setupRowContextMenu(tr);
     // Apply current filter
@@ -1426,25 +1409,123 @@ function clearClickLog() {
 function clearAnnotationMarkers() {
   annotationMarkers.forEach(m => { if (m.parent) m.parent.remove(m); });
   annotationMarkers = [];
+  clearDbhCylinders();
+}
+
+// ═══════════════════════════════════════════════════════════
+// DBH CYLINDERS — wire-frame rings drawn at annotation trunks
+// ═══════════════════════════════════════════════════════════
+
+function clearDbhCylinders() {
+  dbhCylinders.forEach(m => { if (m.parent) m.parent.remove(m); });
+  dbhCylinders = [];
+}
+
+function buildDbhCylinders() {
+  clearDbhCylinders();
+  if (!annotationPositions || annotationPositions.length === 0) return;
+
+  annotationPositions.forEach(ann => {
+    // Prefer tool-measured DBH, fall back to file-provided DBH
+    const dbhVal = ann._dbh != null ? ann._dbh : ann.dbh;
+    if (dbhVal == null) return;  // no DBH — skip
+    const radius = Number(dbhVal) / 2;
+    if (!isFinite(radius) || radius <= 0) return;
+
+    // Determine which row scene and local position to use
+    let targetRow = null;
+    if (!isRawMode) {
+      if (ann.cluster !== undefined && ann.cluster >= 0) {
+        for (const r of linRows) {
+          if (r.clusterIds.includes(ann.cluster)) { targetRow = r; break; }
+        }
+      }
+      if (!targetRow && linRows.length > 0) targetRow = linRows[0];
+    }
+
+    const targetScene = targetRow ? targetRow.scene : scene;
+    const offX = targetRow ? targetRow.centerOffset.x : 0;
+    const offY = targetRow ? targetRow.centerOffset.y : 0;
+    const offZ = targetRow ? targetRow.centerOffset.z : 0;
+    const lx = ann.x - offX;
+    const ly = ann.y - offY;
+    const lz = ann.z - offZ;
+
+    // Cylinder height: use 1 m as a visual reference slice
+    const height = 1.0;
+    const geo = new THREE.CylinderGeometry(radius, radius, height, 32, 1, true);
+    const mat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(document.getElementById('markerColor').value || '#ff69b4'),
+      wireframe: false,
+      transparent: true,
+      opacity: 0.35,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const cyl = new THREE.Mesh(geo, mat);
+    // Place cylinder centred on the trunk position
+    cyl.position.set(lx, ly, lz);
+    // Rotate so the cylinder axis aligns with Z (vertical in the scene)
+    cyl.rotation.x = Math.PI / 2;
+    cyl.renderOrder = 2;
+    cyl.userData.isDbhCylinder = true;
+    cyl.visible = dbhCylindersVisible && annotationVisible;
+    targetScene.add(cyl);
+    dbhCylinders.push(cyl);
+
+    // Thin wireframe ring on top for crispness
+    const ringGeo = new THREE.EdgesGeometry(new THREE.CylinderGeometry(radius, radius, height, 32, 1, true));
+    const ringMat = new THREE.LineBasicMaterial({
+      color: new THREE.Color(document.getElementById('markerColor').value || '#ff69b4'),
+      transparent: true,
+      opacity: 0.85,
+    });
+    const ring = new THREE.LineSegments(ringGeo, ringMat);
+    ring.position.copy(cyl.position);
+    ring.rotation.copy(cyl.rotation);
+    ring.renderOrder = 3;
+    ring.userData.isDbhCylinder = true;
+    ring.visible = dbhCylindersVisible && annotationVisible;
+    targetScene.add(ring);
+    dbhCylinders.push(ring);
+  });
+}
+
+function toggleDbhCylinders() {
+  dbhCylindersVisible = !dbhCylindersVisible;
+  dbhCylinders.forEach(m => { m.visible = dbhCylindersVisible && annotationVisible; });
+  const btn = document.getElementById('tbCylinders');
+  if (btn) btn.classList.toggle('active', dbhCylindersVisible);
+  const count = dbhCylinders.length / 2;  // pairs: mesh + ring
+  if (dbhCylindersVisible && count === 0) status('No DBH values found on annotations.');
+  else if (dbhCylindersVisible) status(`Showing ${count} DBH cylinder(s).`);
+  else status('DBH cylinders hidden.');
 }
 
 function createAnnotationMarker(pos, instanceId) {
-  // Create a canvas-based pink circle texture for a sprite
+  // Create a canvas-based circle texture for a sprite, using the toolbar annotation color
+  const fillColor = document.getElementById('markerColor').value || '#ff69b4';
+  // Darken slightly for the border
+  const c = new THREE.Color(fillColor);
+  c.multiplyScalar(0.7);
+  const strokeColor = '#' + c.getHexString();
   const canvas = document.createElement('canvas');
   canvas.width = 64; canvas.height = 64;
   const ctx = canvas.getContext('2d');
   ctx.beginPath();
   ctx.arc(32, 32, 28, 0, Math.PI * 2);
-  ctx.fillStyle = '#ff69b4';
+  ctx.fillStyle = fillColor;
   ctx.fill();
   ctx.lineWidth = 3;
-  ctx.strokeStyle = '#ff1493';
+  ctx.strokeStyle = strokeColor;
   ctx.stroke();
   const texture = new THREE.CanvasTexture(canvas);
   const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, opacity: 0.9 });
   const sprite = new THREE.Sprite(mat);
   sprite.position.copy(pos);
-  sprite.scale.set(0.8, 0.8, 0.8);
+  const annSize = parseFloat(document.getElementById('markerSizeSlider').value) || 1.0;
+  const annScale = 0.8 * annSize;
+  sprite.scale.set(annScale, annScale, annScale);
   sprite.userData.isAnnotation = true;
   sprite.userData.instanceId = instanceId;
   return sprite;
@@ -1498,6 +1579,8 @@ function buildAnnotationMarkers() {
     targetRow.scene.add(marker);
     annotationMarkers.push(marker);
   });
+  // Rebuild DBH cylinders alongside markers
+  buildDbhCylinders();
 }
 
 function toggleAnnotationVisibility(visible) {
@@ -1511,6 +1594,8 @@ function toggleAnnotationVisibility(visible) {
     if (show && activeIsolatedId !== null && ann.cluster !== activeIsolatedId) show = false;
     m.visible = show;
   });
+  // Sync DBH cylinders with global annotation visibility
+  dbhCylinders.forEach(m => { m.visible = dbhCylindersVisible && annotationVisible; });
 }
 
 function toggleAnnotationFile(filename, visible) {
@@ -1540,154 +1625,22 @@ function filterAnnotationsByCluster(clusterId) {
       }
     }
   });
-}
-
-
-// ═══════════════════════════════════════════════════════════
-// DBH CYLINDERS — visual representation of measured trees
-// ═══════════════════════════════════════════════════════════
-
-let dbhCylinders = [];       // {mesh, annIdx} objects in row scenes
-let dbhCylindersVisible = false;
-let _ctxCylAnnIdx = -1;      // annotation index for cylinder right-click
-
-function buildDbhCylinders() {
-  clearDbhCylinders();
-  if (!annotationPositions || !isRowMode || !linRows.length) return;
-  annotationPositions.forEach((ann, i) => {
-    const dbhStr = ann._dbh;
-    if (!dbhStr) return;
-    const dbh = parseFloat(dbhStr);
-    if (isNaN(dbh) || dbh <= 0) return;
-    const radius = dbh / 2;
-    const height = 2.0; // 2m tall cylinder
-    // Find row for this annotation
-    let targetRow = null;
-    if (ann.cluster !== undefined && ann.cluster >= 0) {
-      for (const r of linRows) { if (r.clusterIds.includes(ann.cluster)) { targetRow = r; break; } }
-    }
-    if (!targetRow) return;
-    // Position in row-local coords
-    const lx = ann.x - targetRow.centerOffset.x;
-    const ly = ann.y - targetRow.centerOffset.y;
-    const lz = ann.z - targetRow.centerOffset.z;
-    // Cylinder at trunk position, bottom at annotation Z - 1.0m
-    const geo = new THREE.CylinderGeometry(radius, radius, height, 16);
-    const mat = new THREE.MeshBasicMaterial({color: 0x8B4513, transparent: true, opacity: 0.5, depthTest: true});
-    const cyl = new THREE.Mesh(geo, mat);
-    // Three.js CylinderGeometry is Y-up, we need Z-up → rotate
-    cyl.rotation.x = Math.PI / 2;
-    cyl.position.set(lx, ly, lz);
-    cyl.userData = { annIdx: i, isCylinder: true };
-    cyl.visible = dbhCylindersVisible;
-    targetRow.scene.add(cyl);
-    dbhCylinders.push({ mesh: cyl, annIdx: i, row: targetRow });
-  });
-}
-
-function clearDbhCylinders() {
-  dbhCylinders.forEach(c => { if (c.mesh.parent) c.mesh.parent.remove(c.mesh); });
-  dbhCylinders = [];
-}
-
-function toggleDbhCylinders() {
-  dbhCylindersVisible = !dbhCylindersVisible;
-  if (dbhCylindersVisible && dbhCylinders.length === 0) buildDbhCylinders();
-  dbhCylinders.forEach(c => {
-    let show = dbhCylindersVisible;
-    if (show && activeIsolatedId !== null) {
-      const ann = annotationPositions[c.annIdx];
-      if (ann && ann.cluster !== activeIsolatedId) show = false;
-    }
-    c.mesh.visible = show;
-  });
-  document.getElementById("tbCylinders").style.background = dbhCylindersVisible ? "#5a3a1a" : "";
-}
-
-function filterCylindersByCluster(clusterId) {
-  if (!dbhCylindersVisible) return;
-  dbhCylinders.forEach(c => {
-    if (clusterId === null) {
-      c.mesh.visible = true;
-    } else {
-      const ann = annotationPositions ? annotationPositions[c.annIdx] : null;
-      c.mesh.visible = ann && ann.cluster === clusterId;
-    }
-  });
-}
-
-function setupCylinderContextMenu() {
-  document.getElementById("ctxCylEdit").addEventListener("click", () => {
-    if (_ctxCylAnnIdx < 0 || !annotationPositions) return;
-    editDbhForTree(_ctxCylAnnIdx);
-  });
-  document.addEventListener("click", () => {
-    document.getElementById("cylContextMenu").style.display = "none";
-  });
-}
-
-function onCylinderRightClick(e) {
-  if (!dbhCylindersVisible || !isRowMode) return;
-  const ri = getRowAtMouse(e.clientX, e.clientY);
-  if (!ri) return;
-  const rect = renderer.domElement.getBoundingClientRect();
-  const mx = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-  const my = -((ri.localY) / ri.rowH) * 2 + 1;
-  const rc = new THREE.Raycaster();
-  rc.setFromCamera(new THREE.Vector2(mx, my), ri.row.camera);
-  // Check cylinder meshes in this row
-  const rowCyls = dbhCylinders.filter(c => c.row === ri.row).map(c => c.mesh);
-  if (!rowCyls.length) return;
-  const hits = rc.intersectObjects(rowCyls);
-  if (hits.length > 0) {
-    e.preventDefault();
-    _ctxCylAnnIdx = hits[0].object.userData.annIdx;
-    const menu = document.getElementById("cylContextMenu");
-    menu.style.display = "block";
-    menu.style.left = e.clientX + "px";
-    menu.style.top = e.clientY + "px";
+  // Mirror the same filter on DBH cylinders (pairs: mesh + ring per annotation)
+  if (dbhCylinders.length > 0) {
+    // Rebuild a per-annotation index: cylinders are pushed in pairs per annotation that has a DBH
+    // Walk annotationPositions in the same order buildDbhCylinders does and match cylinder pairs
+    let cylIdx = 0;
+    annotationPositions.forEach(ann => {
+      const dbhVal = ann._dbh != null ? ann._dbh : ann.dbh;
+      if (dbhVal == null) return;
+      const fileVis = annotationFileVisibility[ann.file] !== false;
+      const show = dbhCylindersVisible && annotationVisible && fileVis &&
+                   (clusterId === null || ann.cluster === clusterId);
+      // Each annotation with DBH contributes 2 entries (mesh + ring)
+      if (cylIdx < dbhCylinders.length)   { dbhCylinders[cylIdx].visible = show;     cylIdx++; }
+      if (cylIdx < dbhCylinders.length)   { dbhCylinders[cylIdx].visible = show;     cylIdx++; }
+    });
   }
-}
-
-let _editingDbhAnnIdx = -1;   // track which tree is being edited
-let _editingDbhOldValue = null; // preserve old DBH until save
-
-function editDbhForTree(annIdx) {
-  if (!annotationPositions || annIdx >= annotationPositions.length) return;
-  const ann = annotationPositions[annIdx];
-  _editingDbhAnnIdx = annIdx;
-  _editingDbhOldValue = ann._dbh || null;
-
-  // Hide ONLY this tree's cylinder
-  dbhCylinders.forEach(c => {
-    if (c.annIdx === annIdx) c.mesh.visible = false;
-  });
-
-  // Highlight this tree's row in the table
-  clearEditHighlight();
-  const tbody = document.getElementById("clickLogTbody");
-  tbody.querySelectorAll("tr.ann-row").forEach(tr => {
-    if (parseInt(tr.dataset.annIdx) === annIdx) {
-      tr.style.background = "rgba(255,165,0,.3)";
-      tr.style.outline = "1px solid #f90";
-      tr.scrollIntoView({ block: "nearest", behavior: "smooth" });
-    }
-  });
-
-  // If already in sliced top view, stay there — just let user place circle
-  if (dbhTopViewMode && dbhSliceActive) {
-    status(`Editing tree #${ann.instance} — dbl-click to place circle, +/- resize, Enter lock`);
-    return;
-  }
-
-  // Otherwise, isolate cluster and open DBH tool
-  if (ann.cluster !== undefined && ann.cluster >= 0 && activeIsolatedId !== ann.cluster) {
-    isolateCluster(ann.cluster);
-  }
-  setTimeout(() => {
-    openDbhCalc();
-    status(`Editing DBH for tree #${ann.instance} — old DBH: ${_editingDbhOldValue || '—'}`);
-  }, 100);
 }
 
 
@@ -1899,26 +1852,6 @@ function closeSliceTool() {
     isolateCluster(dbhSavedClusterId);
   }
   dbhSavedClusterId = null;
-  // If editing a tree's DBH and cancelled, restore the old value
-  if (_editingDbhAnnIdx >= 0 && annotationPositions) {
-    if (_editingDbhOldValue !== null) {
-      annotationPositions[_editingDbhAnnIdx]._dbh = _editingDbhOldValue;
-      const tbody = document.getElementById("clickLogTbody");
-      tbody.querySelectorAll("tr.ann-row").forEach(tr => {
-        if (parseInt(tr.dataset.annIdx) === _editingDbhAnnIdx) {
-          const c = tr.querySelector(".dbh-cell");
-          if (c) c.textContent = _editingDbhOldValue;
-        }
-      });
-    }
-    // Restore the hidden cylinder immediately
-    dbhCylinders.forEach(c => {
-      if (c.annIdx === _editingDbhAnnIdx) c.mesh.visible = dbhCylindersVisible;
-    });
-  }
-  clearEditHighlight();
-  _editingDbhAnnIdx = -1;
-  _editingDbhOldValue = null;
 }
 
 function updateDbhRedPlane() {
@@ -1948,14 +1881,15 @@ function doDbhSlice() {
   if (annotationPositions) {
     annotationPositions.forEach(ann => {
       if (ann.cluster !== activeIsolatedId) return;
+      // ann.x/y/z are in global linearized centered coords
+      // Convert to row-local by subtracting centerOffset
       const lx = ann.x - r.centerOffset.x;
       const ly = ann.y - r.centerOffset.y;
       trunkXYs.push({ x: lx, y: ly });
     });
   }
 
-  const hasAnnotations = trunkXYs.length > 0;
-  const trunkRadius = 0.8;
+  const trunkRadius = 0.8; // meters — keep points within this XY distance of a known trunk
   const trunkRadSq = trunkRadius * trunkRadius;
 
   for(let i=0;i<n;i++){
@@ -1969,21 +1903,16 @@ function doDbhSlice() {
       continue;
     }
 
-    if (hasAnnotations) {
-      // WITH annotations: keep only points near known trunks and above ground
-      let nearTrunk = false;
-      for(const t of trunkXYs) {
-        const dx = x - t.x, dy = y - t.y;
-        if(dx*dx + dy*dy < trunkRadSq) { nearTrunk = true; break; }
-      }
-      if(!nearTrunk || z < gz + 0.3) {
-        arr[i*3]=0; arr[i*3+1]=0; arr[i*3+2]=0;
-      }
-    } else {
-      // WITHOUT annotations: simple ground removal — keep trunk band only
-      if(z < gz + 0.3) {
-        arr[i*3]=0; arr[i*3+1]=0; arr[i*3+2]=0;
-      }
+    // Check if this point is near any known trunk AND above ground
+    let nearTrunk = false;
+    for(const t of trunkXYs) {
+      const dx = x - t.x, dy = y - t.y;
+      if(dx*dx + dy*dy < trunkRadSq) { nearTrunk = true; break; }
+    }
+
+    // Must be near a trunk AND above ground+0.3m (skip ground surface)
+    if(!nearTrunk || z < gz + 0.3) {
+      arr[i*3]=0; arr[i*3+1]=0; arr[i*3+2]=0;
     }
   }
 
@@ -2232,39 +2161,6 @@ function saveAndReturnToCluster() {
     isolateCluster(dbhSavedClusterId);
   }
   dbhSavedClusterId = null;
-  // Update the highlighted row with new DBH value if editing
-  if (_editingDbhAnnIdx >= 0 && annotationPositions) {
-    const newDbh = annotationPositions[_editingDbhAnnIdx]._dbh;
-    if (newDbh) {
-      const tbody = document.getElementById("clickLogTbody");
-      tbody.querySelectorAll("tr.ann-row").forEach(tr => {
-        if (parseInt(tr.dataset.annIdx) === _editingDbhAnnIdx) {
-          const c = tr.querySelector(".dbh-cell");
-          if (c) c.textContent = newDbh;
-          // Flash green to confirm update
-          tr.style.background = "rgba(0,200,80,.4)";
-          tr.style.outline = "1px solid #0c8";
-          setTimeout(() => { tr.style.background = ""; tr.style.outline = ""; }, 1500);
-        }
-      });
-    }
-  }
-  _editingDbhAnnIdx = -1;
-  _editingDbhOldValue = null;
-  // Rebuild cylinders to reflect new/changed DBH values
-  if (dbhCylindersVisible) {
-    buildDbhCylinders();
-    if (activeIsolatedId !== null) filterCylindersByCluster(activeIsolatedId);
-  }
-}
-
-function clearEditHighlight() {
-  const tbody = document.getElementById("clickLogTbody");
-  if (!tbody) return;
-  tbody.querySelectorAll("tr.ann-row").forEach(tr => {
-    tr.style.background = "";
-    tr.style.outline = "";
-  });
 }
 
 function onDbhDoubleClick(ri,e){
@@ -2346,7 +2242,7 @@ function loadCloud(data) {
   fitCameraFront(mainPoints, camera, mainVP);
   fitCamera(clusterPoints, cCamera, clsVP);
   updateDBTree(); showMainProps(); showClusterProps(data.cluster_stats, data.cluster_colors);
-  document.getElementById("pGridRes").value = lastGridRes;
+  document.getElementById("pEpsParam").value = lastEpsParam;
   document.getElementById("pOverlap").value = data.overlap || 0.15;
   document.getElementById("btnRecluster").textContent = "Re-Cluster";
   document.getElementById("btnApplyOverlap").disabled = false;
@@ -2365,14 +2261,10 @@ function loadCloud(data) {
   // Handle annotation positions — show pink markers on annotated tree trunks
   annotationPositions = data.annotation_positions || null;
   if (annotationPositions && annotationPositions.length > 0) {
-    // Pre-populate _dbh from server data (e.g. CSV annotations with DBH column)
-    annotationPositions.forEach(a => {
-      if (a.dbh !== undefined && a.dbh !== null && !a._dbh) a._dbh = String(a.dbh);
-      if (annotationFileVisibility[a.file] === undefined) annotationFileVisibility[a.file] = true;
-    });
+    // Initialize per-file visibility
+    annotationPositions.forEach(a => { if (annotationFileVisibility[a.file] === undefined) annotationFileVisibility[a.file] = true; });
     buildAnnotationMarkers();
     addAnnotationLogEntries(annotationPositions);
-    buildDbhCylinders();
   }
   updateDBTree();  // refresh to show annotation files
 
@@ -2424,7 +2316,6 @@ function loadRawCloud(data) {
   if (data.annotation && data.annotation.raw_positions && data.annotation.raw_positions.length > 0) {
     annotationPositions = data.annotation.raw_positions;
     annotationPositions.forEach(a => {
-      if (a.dbh !== undefined && a.dbh !== null && !a._dbh) a._dbh = String(a.dbh);
       if (annotationFileVisibility[a.file] === undefined) annotationFileVisibility[a.file] = true;
     });
     // Create markers directly in the main scene for raw view
@@ -2438,6 +2329,7 @@ function loadRawCloud(data) {
       scene.add(marker);
       annotationMarkers.push(marker);
     });
+    buildDbhCylinders();
     addAnnotationLogEntries(annotationPositions);
   }
 
@@ -2570,8 +2462,6 @@ function isolateCluster(clusterId) {
     filterAnnotationsByCluster(clusterId);
     // Filter click log table to show only this cluster's rows
     filterClickLogByCluster(clusterId);
-    // Filter cylinders to show only this cluster
-    filterCylindersByCluster(clusterId);
 
     const col = cloudData.cluster_colors[clusterId];
     const rgb = col ? `rgb(${Math.round(col[0]*255)},${Math.round(col[1]*255)},${Math.round(col[2]*255)})` : '#fff';
@@ -2645,7 +2535,6 @@ function clearIsolation() {
     repositionMarkersInRows();
     filterAnnotationsByCluster(null);  // show all annotations
     filterClickLogByCluster(null);     // show all table rows
-    filterCylindersByCluster(null);    // show all cylinders
     if (cloudData) status(`Showing all — ${cloudData.meta.n_clusters} clusters`);
     return;
   }
@@ -2963,6 +2852,7 @@ function clearScene() {
   linLabels = null; clsLabels = null; clsPositions = null; clsColors = null;
   hoveredCluster = -1;
   clearAnnotationMarkers();
+  clearDbhCylinders();
   annotationPositions = null;
   // Keep annotationFileVisibility and annotationVisible across reclusters
   // They are only fully reset when _clearAll is called
@@ -2976,8 +2866,6 @@ function clearScene() {
   dbhPlacedCircles=[];
   dbhHiddenPoints = null; dbhSavedCams = {};
   dbhLinesVisible = false; dbhGroundGrids = {};
-  clearDbhCylinders(); dbhCylindersVisible = false;
-  document.getElementById("tbCylinders").style.background = "";
   document.getElementById("isolatedBanner").style.display = "none";
   clearClickLog();
 }
@@ -3093,7 +2981,6 @@ function resetView() {
 
 
 // ═══════════════════════════════════════════════════════════
-// COORD READOUT
 // ═══════════════════════════════════════════════════════════
 
 let _hoveredAnnIdx = -1;
@@ -3258,9 +3145,10 @@ function updateDBTree() {
       const shortName = fn.replace(/\.[^.]+$/, '').replace(/^.*?_(\d+)$/, 'Tree #$1');
       const inst = annotationPositions.find(a => a.file === fn);
       const instLabel = inst ? inst.instance : '?';
+      const annDotColor = document.getElementById('markerColor').value || '#ff69b4';
       html += `<div class="dbi ann-file" style="padding-left:28px;">
         <span class="dbi-eye ${vis ? 'on' : 'off'}" onclick="event.stopPropagation();window._toggleAnnFile('${fn}')" title="Toggle visibility">${vis ? '👁' : '👁‍🗨'}</span>
-        <span class="dbi-icon" style="color:#ff69b4;">●</span><span class="dbi-name" title="${fn}">${shortName} (${instLabel})</span></div>`;
+        <span class="dbi-icon" style="color:${annDotColor};">●</span><span class="dbi-name" title="${fn}">${shortName} (${instLabel})</span></div>`;
     });
   } else if (cloudData._annotationTrees && cloudData._annotationTrees.length > 0) {
     // Raw mode: show uploaded annotation files (markers appear after clustering)
@@ -3268,10 +3156,11 @@ function updateDBTree() {
     html += `<div class="dbi ann-header" style="margin-top:4px;border-top:1px solid var(--bd);padding-top:4px;">
       <span class="dbi-icon">📋</span><span class="dbi-name">Annotations (${trees.length} trees)</span>
       <span class="dbi-badge ann-badge">${trees.length}</span></div>`;
+    const annDotColor = document.getElementById('markerColor').value || '#ff69b4';
     trees.forEach(t => {
       const shortName = t.file.replace(/\.[^.]+$/, '').replace(/^.*?_(\d+)$/, 'Tree #$1');
       html += `<div class="dbi ann-file" style="padding-left:28px;">
-        <span class="dbi-icon" style="color:#ff69b4;">●</span><span class="dbi-name" title="${t.file}">${shortName} (${t.instance})</span>
+        <span class="dbi-icon" style="color:${annDotColor};">●</span><span class="dbi-name" title="${t.file}">${shortName} (${t.instance})</span>
         <span style="font-size:9px;color:var(--txd);">${t.count.toLocaleString()} pts</span></div>`;
     });
   }

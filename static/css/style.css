@@ -22,6 +22,7 @@ body{font:12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgr
 .tb-export{background:#7a5c00;border-color:#a07800;}.tb-export:hover{background:#a07800;}
 .tb-danger{background:#7a0000;border-color:#a00000;color:#faa;}.tb-danger:hover{background:#a00000;}
 .tb-lighting.active{background:#1a4a6a;border-color:#2a7aaa;color:#8cf;}.tb-lighting:not(.active){background:#333;border-color:#555;color:#888;}
+.tb-cylinders.active{background:#1a4a2a;border-color:#2a8a4a;color:#8f8;}.tb-cylinders:not(.active){background:#333;border-color:#555;color:#888;}
 .tb-compute{background:#2a4a2a;border-color:#3a6a3a;color:#8f8;font-weight:bold;font-size:12px;}.tb-compute:hover{background:#3a6a3a;}.tb-compute.computing{background:#6a4a0a;border-color:#aa7a1a;color:#fda;animation:pulse 1s infinite;}
 @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.5;}}
 .tselect{height:24px;background:var(--bg2);border:1px solid var(--bd);color:var(--tx);border-radius:3px;font-size:11px;padding:0 4px;cursor:pointer;}
