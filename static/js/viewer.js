@@ -70,12 +70,21 @@ let clickedPoints = [], clickMarkers = [], clickIdCounter = 0;
 let hoveredCluster = -1;
 let linBaseColors = null;      // Float32Array — white base colors for linearized view
 
+// Point hover ring — shows a glowing ring around the nearest point under cursor
+let _hoverRing = null;         // THREE.Mesh — reused across all scenes
+let _hoverRingScene = null;    // which scene the ring is currently in
+let _hoverRafPending = false;  // throttle flag
+let _lastHoverEvent = null;    // last mousemove event for RAF callback
+
 // Normal/Curvature display state
 let displayMode = 'white';     // 'white' | 'normal' | 'curvature'
 let normalColorsData = null;   // Float32Array — normal RGB per linearized point
 let curvatureColorsData = null; // Float32Array — curvature color per linearized point
 let whiteColorsData = null;    // Float32Array — default white colors
+let rawWhiteColorsData = null; // Float32Array — white colors for raw cloud display
 let normalsComputed = false;
+let whiteTintColor = [1.0, 1.0, 1.0]; // RGB tint applied in white display mode
+let currentBgMode = 'gradient';       // persists across cloud reloads
 
 // Annotation state
 let annotationPositions = null;  // array of {x,y,z,instance,file,...} in linearized space
@@ -206,7 +215,7 @@ function buildRowScenes() {
     cx /= count; cy /= count; cz /= count;
     for (let j = 0; j < count; j++) { pos[j*3] -= cx; pos[j*3+1] -= cy; pos[j*3+2] -= cz; }
 
-    const rowScene = new THREE.Scene(); setBg("gradient", rowScene);
+    const rowScene = new THREE.Scene(); setBg(currentBgMode, rowScene);
     rowScene.add(new THREE.AmbientLight(0xffffff, 0.6));
     const dl = new THREE.DirectionalLight(0xffffff, 0.8); dl.position.set(10, 20, 10); rowScene.add(dl);
     const rowCam = new THREE.PerspectiveCamera(60, screenW / Math.max(rowH, 1), 0.001, 5000);
@@ -280,7 +289,7 @@ function init() {
 
 function initMainViewport() {
   const c = document.getElementById("viewportContainer");
-  scene = new THREE.Scene(); setBg("gradient", scene);
+  scene = new THREE.Scene(); setBg(currentBgMode, scene);
   camera = new THREE.PerspectiveCamera(60, c.clientWidth/c.clientHeight, 0.001, 5000);
   camera.position.set(0,5,15); camera.lookAt(0,0,0);
   renderer = new THREE.WebGLRenderer({antialias:true, preserveDrawingBuffer:true});
@@ -295,7 +304,7 @@ function initMainViewport() {
 
 function initClusterViewport() {
   const c = document.getElementById("clusterViewContainer"); if (!c) return;
-  cScene = new THREE.Scene(); setBg("gradient", cScene);
+  cScene = new THREE.Scene(); setBg(currentBgMode, cScene);
   const w = c.clientWidth||296, h = c.clientHeight||200;
   cCamera = new THREE.PerspectiveCamera(60, w/Math.max(h,1), 0.001, 5000);
   cCamera.position.set(0,5,15); cCamera.lookAt(0,0,0);
@@ -373,6 +382,7 @@ function setupMainControls() {
   el.addEventListener("mousemove", e => {
     updateCoordReadout(e);
     highlightNearestAnnotationRow(e);
+    updatePointHoverRing(e);
     if(!dragVP||(!dragVP.isLeftDown&&!dragVP.isRightDown&&!dragVP.isMiddleDown)) return;
     const cur=new THREE.Vector2(e.clientX,e.clientY), delta=new THREE.Vector2().subVectors(cur,dragVP.lastMousePos);
     if(delta.length()>1.5) dragVP.mouseMoved=true;
@@ -382,6 +392,7 @@ function setupMainControls() {
     dragVP.lastMousePos.copy(cur);
   });
   el.addEventListener("mouseup", ()=>{if(dragVP){dragVP.isLeftDown=dragVP.isRightDown=dragVP.isMiddleDown=false;}});
+  el.addEventListener("mouseleave", () => { clearPointHoverRing(); });
   el.addEventListener("wheel", e=>{
     if (isRowMode) {
       const ri = getRowAtMouse(e.clientX, e.clientY);
@@ -397,6 +408,7 @@ function setupMainControls() {
     }
   },{passive:false});
   el.addEventListener("dblclick", e=>{
+    clearPointHoverRing();
     if (isRowMode) {
       const ri = getRowAtMouse(e.clientX, e.clientY);
       if (ri && !ri.row.vp.mouseMoved) onRowDoubleClick(e, ri);
@@ -477,6 +489,122 @@ function handleZoom(event,cam,vp) {
   if(cam===camera) updateMarkerSizes();
 }
 
+
+// ═══════════════════════════════════════════════════════════
+// POINT HOVER RING — glowing border around candidate click target
+// ═══════════════════════════════════════════════════════════
+
+function _getOrCreateHoverRing() {
+  if (_hoverRing) return _hoverRing;
+  // Build a circle outline using LineLoop
+  const segments = 32;
+  const pts = [];
+  for (let i = 0; i <= segments; i++) {
+    const a = (i / segments) * Math.PI * 2;
+    pts.push(new THREE.Vector3(Math.cos(a), Math.sin(a), 0));
+  }
+  const geo = new THREE.BufferGeometry().setFromPoints(pts);
+  const mat = new THREE.LineBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0.92,
+    depthTest: false,
+    linewidth: 1,  // note: only >1 on some WebGL implementations
+  });
+  _hoverRing = new THREE.LineLoop(geo, mat);
+  _hoverRing.renderOrder = 9999;
+  _hoverRing.visible = false;
+  return _hoverRing;
+}
+
+function _placeHoverRing(scene, position, radius) {
+  const ring = _getOrCreateHoverRing();
+  // Move ring to new scene if needed
+  if (_hoverRingScene && _hoverRingScene !== scene) {
+    _hoverRingScene.remove(ring);
+  }
+  if (_hoverRingScene !== scene) {
+    scene.add(ring);
+    _hoverRingScene = scene;
+  }
+  ring.position.copy(position);
+  ring.scale.setScalar(radius);
+  ring.visible = true;
+  // Pulse the opacity slightly using elapsed time
+  const t = (performance.now() % 1200) / 1200;
+  const pulse = 0.65 + 0.35 * Math.sin(t * Math.PI * 2);
+  ring.material.opacity = pulse;
+}
+
+function clearPointHoverRing() {
+  if (_hoverRing) _hoverRing.visible = false;
+}
+
+function _hoverRingRadius(camera, vp) {
+  // Scale ring so it appears as a fixed screen-space circle regardless of zoom
+  const dist = camera.position.distanceTo(vp.pivotPoint);
+  return Math.max(0.02, dist * 0.018);
+}
+
+function updatePointHoverRing(e) {
+  // Throttle to one raycast per animation frame
+  _lastHoverEvent = e;
+  if (_hoverRafPending) return;
+  _hoverRafPending = true;
+  requestAnimationFrame(() => {
+    _hoverRafPending = false;
+    const ev = _lastHoverEvent;
+    if (!ev) return;
+
+    if (isRowMode && linRows.length > 0) {
+      const ri = getRowAtMouse(ev.clientX, ev.clientY);
+      if (!ri) { clearPointHoverRing(); return; }
+
+      const rect = renderer.domElement.getBoundingClientRect();
+      const mx = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+      const my = -((ri.localY) / ri.rowH) * 2 + 1;
+      const rc = new THREE.Raycaster();
+      rc.setFromCamera(new THREE.Vector2(mx, my), ri.row.camera);
+      const dist = ri.row.camera.position.distanceTo(ri.row.vp.pivotPoint);
+      rc.params.Points.threshold = Math.max(0.005, Math.min(0.3, 0.012 * (dist / 15)));
+
+      const hits = rc.intersectObject(ri.row.points);
+      const colAttr = ri.row.points.geometry.attributes.color;
+      const validHit = hits.find(ix => {
+        if (!colAttr) return true;
+        return (colAttr.getX(ix.index) + colAttr.getY(ix.index) + colAttr.getZ(ix.index)) >= 0.01;
+      });
+
+      if (!validHit) { clearPointHoverRing(); return; }
+      const pa = ri.row.points.geometry.attributes.position;
+      const pos = new THREE.Vector3(pa.getX(validHit.index), pa.getY(validHit.index), pa.getZ(validHit.index));
+      _placeHoverRing(ri.row.scene, pos, _hoverRingRadius(ri.row.camera, ri.row.vp));
+
+    } else {
+      const target = getActiveMainTarget();
+      if (!target) { clearPointHoverRing(); return; }
+      const rect = renderer.domElement.getBoundingClientRect();
+      const mx = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+      const my = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+      const rc = new THREE.Raycaster();
+      rc.setFromCamera(new THREE.Vector2(mx, my), camera);
+      const dist = camera.position.distanceTo(mainVP.pivotPoint);
+      rc.params.Points.threshold = Math.max(0.005, Math.min(0.3, 0.012 * (dist / 15)));
+
+      const hits = rc.intersectObject(target);
+      const colAttr = target.geometry.attributes.color;
+      const validHit = hits.find(ix => {
+        if (!colAttr) return true;
+        return (colAttr.getX(ix.index) + colAttr.getY(ix.index) + colAttr.getZ(ix.index)) >= 0.01;
+      });
+
+      if (!validHit) { clearPointHoverRing(); return; }
+      const pa = target.geometry.attributes.position;
+      const pos = new THREE.Vector3(pa.getX(validHit.index), pa.getY(validHit.index), pa.getZ(validHit.index));
+      _placeHoverRing(scene, pos, _hoverRingRadius(camera, mainVP));
+    }
+  });
+}
 
 // ═══════════════════════════════════════════════════════════
 // HOVER HIGHLIGHT — cluster in right panel → highlight in main
@@ -619,8 +747,16 @@ function onMainDoubleClick(event) {
   if(!intersects.length){threshUsed=dynThresh*2;rc.params.Points.threshold=threshUsed;intersects=rc.intersectObject(target);}
   if(!intersects.length){threshUsed=dynThresh*4;rc.params.Points.threshold=threshUsed;intersects=rc.intersectObject(target);}
 
-  if (intersects.length>0) {
-    const hit=intersects[0];
+  // Skip invisible (black/discarded) points — the shader discards them visually but
+  // Three.js raycasting still hits them, causing misses from certain viewpoints.
+  const colAttrMain = target.geometry.attributes.color;
+  const hit = intersects.find(ix => {
+    if (!colAttrMain) return true;
+    const r = colAttrMain.getX(ix.index), g = colAttrMain.getY(ix.index), b = colAttrMain.getZ(ix.index);
+    return (r + g + b) >= 0.01;
+  });
+
+  if (hit) {
     const pi=hit.index;
     const pa=target.geometry.attributes.position;
     if(pi>=pa.count) return;
@@ -730,8 +866,17 @@ function onRowDoubleClick(event, ri) {
 
   let intersects = rc.intersectObject(ri.row.points);
   if (!intersects.length) { rc.params.Points.threshold *= 3; intersects = rc.intersectObject(ri.row.points); }
-  if (intersects.length > 0) {
-    const hit = intersects[0], pi = hit.index;
+
+  // Skip invisible (black/discarded) points
+  const colAttrRow = ri.row.points.geometry.attributes.color;
+  const rowHit = intersects.find(ix => {
+    if (!colAttrRow) return true;
+    const r = colAttrRow.getX(ix.index), g = colAttrRow.getY(ix.index), b = colAttrRow.getZ(ix.index);
+    return (r + g + b) >= 0.01;
+  });
+
+  if (rowHit) {
+    const hit = rowHit, pi = hit.index;
     const pa = ri.row.points.geometry.attributes.position;
     if (pi >= pa.count) return;
     const ex = pa.getX(pi), ey = pa.getY(pi), ez = pa.getZ(pi);
@@ -2156,9 +2301,8 @@ function loadCloud(data) {
   clearScene();
   cloudData = data; cloudId = data.id;
 
-  // Reset display mode to white
-  displayMode = 'white';
-  updateColorScaleBar('white');
+  // Keep the user's current display mode — only reset if normals won't be available
+  updateColorScaleBar(displayMode);
 
   // Linearized view — decode base64 arrays
   fullLinPositions = decodeArr(data.linearized.positions, 'float32');
@@ -2176,11 +2320,14 @@ function loadCloud(data) {
     normalsComputed = true;
   } else {
     normalColorsData = null; curvatureColorsData = null; normalsComputed = false;
+    if (displayMode !== 'white') { displayMode = 'white'; }
   }
   updateDisplayMenuChecks();
 
   mainPoints = makePoints(fullLinPositions, fullLinColors);
   scene.add(mainPoints);
+  // Apply the current display mode and point tint to the freshly loaded cloud
+  applyDisplayColors();
 
   // Clustered view — decode base64 arrays
   clsPositions = decodeArr(data.clustered.positions, 'float32');
@@ -2246,12 +2393,27 @@ function loadRawCloud(data) {
   cloudData = data; cloudId = data.id;
   isRawMode = true;
 
+  // Reset display mode
+  displayMode = 'white';
+  updateColorScaleBar('white');
+
   const positions = decodeArr(data.positions, 'float32');
   const colors = decodeArr(data.colors, 'float32');
 
+  // Store raw color data for display-mode switching
+  rawWhiteColorsData = new Float32Array(colors);
+  // Normals are computed async after load — reset state for now
+  normalColorsData = null; curvatureColorsData = null; normalsComputed = false;
+  updateDisplayMenuChecks();
+
   rawPoints = makePoints(positions, colors);
   scene.add(rawPoints);
+  // Apply whiteTintColor to the freshly loaded raw cloud
+  applyDisplayColors();
   fitCamera(rawPoints, camera, mainVP);
+
+  // Kick off background normals computation — available once done
+  _fetchRawNormals();
 
   // Store annotation info for later use after clustering
   if (data.annotation && data.annotation.trees) {
@@ -2378,16 +2540,16 @@ function isolateCluster(clusterId) {
 
       if (hasCluster) {
         targetRow = r;
-        // This row contains the cluster → show only it colored, hide others
+        // This row contains the cluster → show it with display-mode colors, dim others
         for (let i = 0; i < n; i++) {
           if (r.labels[i] === clusterId) {
-            arr[i*3] = cc[0]; arr[i*3+1] = cc[1]; arr[i*3+2] = cc[2];
+            arr[i*3] = r.baseColors[i*3]; arr[i*3+1] = r.baseColors[i*3+1]; arr[i*3+2] = r.baseColors[i*3+2];
           } else {
             arr[i*3] = 0.0; arr[i*3+1] = 0.0; arr[i*3+2] = 0.0;
           }
         }
       } else {
-        // Other rows → keep normal white colors (restore base)
+        // Other rows → keep normal display-mode colors (restore base)
         colAttr.array.set(r.baseColors);
       }
       colAttr.needsUpdate = true;
@@ -2424,14 +2586,29 @@ function isolateCluster(clusterId) {
     return;
   }
 
-  // ── Single-scene mode (no rows): original behavior ──
-  if (mainPoints) mainPoints.visible = false;
-
+  // ── Single-scene mode (no rows): show mainPoints filtered by cluster with display-mode colors ──
   if (activeIsolatedId !== null && isolatedMeshes[activeIsolatedId]) {
     isolatedMeshes[activeIsolatedId].visible = false;
   }
 
-  if (isolatedMeshes[clusterId]) {
+  // Keep mainPoints visible — paint cluster with display-mode colors, dim others
+  if (mainPoints && linLabels && linBaseColors) {
+    mainPoints.visible = true;
+    const colAttr = mainPoints.geometry.attributes.color;
+    const arr = colAttr.array;
+    const n = linLabels.length;
+    for (let i = 0; i < n; i++) {
+      if (linLabels[i] === clusterId) {
+        arr[i*3] = linBaseColors[i*3]; arr[i*3+1] = linBaseColors[i*3+1]; arr[i*3+2] = linBaseColors[i*3+2];
+      } else {
+        arr[i*3] = 0.0; arr[i*3+1] = 0.0; arr[i*3+2] = 0.0;
+      }
+    }
+    colAttr.needsUpdate = true;
+    fitCamera(mainPoints, camera, mainVP);
+  } else if (isolatedMeshes[clusterId]) {
+    // Fallback: use pre-built isolated mesh
+    mainPoints.visible = false;
     isolatedMeshes[clusterId].visible = true;
     fitCamera(isolatedMeshes[clusterId], camera, mainVP);
   }
@@ -2480,7 +2657,13 @@ function clearIsolation() {
     isolatedMeshes[activeIsolatedId].visible = false;
   }
 
+  // Restore display-mode base colors on mainPoints
   mainPoints.visible = true;
+  if (linBaseColors) {
+    const colAttr = mainPoints.geometry.attributes.color;
+    colAttr.array.set(linBaseColors);
+    colAttr.needsUpdate = true;
+  }
   activeIsolatedId = null;
   repositionAllMarkers();
   fitCameraFront(mainPoints, camera, mainVP);
@@ -2547,12 +2730,12 @@ function setupRecluster() {
   // Full re-cluster (or first-time clustering from raw mode)
   document.getElementById("btnRecluster").addEventListener("click", () => {
     if (!cloudId) { status("No cloud loaded"); return; }
-    const gr = parseFloat(document.getElementById("pGridRes").value) || 0.6;
-    const ov = parseFloat(document.getElementById("pOverlap").value) || 0.15;
-    lastGridRes = gr;
+    const gr = parseFloat(document.getElementById("pEpsParam").value) || 0.6;
+    const ov = parseFloat(document.getElementById("pOverlap").value);
+    lastEpsParam = gr;
     showLoading(isRawMode ? "Clustering & linearizing…" : "Re-clustering…");
     fetch("/recluster", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cloud_id: cloudId, grid_resolution: gr, overlap: ov }) })
+      body: JSON.stringify({ cloud_id: cloudId, grid_resolution: gr, overlap: isNaN(ov) ? 0.15 : ov }) })
     .then(r => r.json()).then(d => {
       hideLoading();
       if (d.error) { status("Error: " + d.error); return; }
@@ -2581,10 +2764,10 @@ function setupRecluster() {
   document.getElementById("btnApplyOverlap").addEventListener("click", () => {
     if (!cloudId) { status("No cloud loaded"); return; }
     if (isRawMode) { status("Cluster first before adjusting overlap."); return; }
-    const ov = parseFloat(document.getElementById("pOverlap").value) || 0.15;
+    const ov = parseFloat(document.getElementById("pOverlap").value);
     status("Applying overlap…");
     fetch("/relinearize", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cloud_id: cloudId, overlap: ov }) })
+      body: JSON.stringify({ cloud_id: cloudId, overlap: isNaN(ov) ? 0.15 : ov }) })
     .then(r => r.json()).then(d => {
       if (d.error) { status("Error: " + d.error); return; }
       reloadViews(d);
@@ -2601,6 +2784,7 @@ function reloadViews(d) {
   isolatedMeshes = {};
   if (clusterPoints) cScene.remove(clusterPoints);
   clearClicksQuiet();
+  clearClickLog();
   clearHoverHighlight();
   hoveredCluster = -1;
   activeIsolatedId = null;
@@ -2633,8 +2817,9 @@ function reloadViews(d) {
 
   mainPoints = makePoints(fullLinPositions, fullLinColors);
   scene.add(mainPoints);
-
-  // Rebuild clustered view
+  // Re-apply current display mode and point tint after rebuild
+  applyDisplayColors();
+  updateDisplayMenuChecks();
   clsPositions = decodeArr(d.clustered.positions, 'float32');
   clsColors = decodeArr(d.clustered.colors, 'float32');
   if (d.clustered.original_xyz) clsOrigXYZ = decodeArr(d.clustered.original_xyz, 'float64');
@@ -2665,9 +2850,14 @@ function reloadViews(d) {
     buildAnnotationMarkers();
     addAnnotationLogEntries(annotationPositions);
   } else if (annotationPositions && annotationPositions.length > 0) {
+    // No new positions from server — rebuild markers using existing coords
     buildAnnotationMarkers();
+    addAnnotationLogEntries(annotationPositions);
   }
   updateDBTree();
+
+  // Restore user-placed click markers (same as loadCloud)
+  loadSavedClicks();
 
   cloudData.linearized = d.linearized;
   cloudData.clustered = d.clustered;
@@ -2756,6 +2946,8 @@ function makePoints(pos, col) {
 
 function clearScene() {
   clearLinRows();
+  clearPointHoverRing();
+  _hoverRingScene = null;
   if (rawPoints) { scene.remove(rawPoints); rawPoints = null; }
   if (mainPoints) { scene.remove(mainPoints); mainPoints = null; }
   Object.values(isolatedMeshes).forEach(m => scene.remove(m));
@@ -2767,7 +2959,7 @@ function clearScene() {
   isRawMode = false;
   originalXYZ = null; clsOrigXYZ = null;
   fullLinPositions = null; fullLinColors = null; linBaseColors = null;
-  whiteColorsData = null; normalColorsData = null; curvatureColorsData = null; normalsComputed = false;
+  whiteColorsData = null; rawWhiteColorsData = null; normalColorsData = null; curvatureColorsData = null; normalsComputed = false;
   linLabels = null; clsLabels = null; clsPositions = null; clsColors = null;
   hoveredCluster = -1;
   clearAnnotationMarkers();
@@ -3252,9 +3444,9 @@ function setupMenus() {
   document.getElementById("menuCloseAll").addEventListener("click", () => window._clearAll());
   document.getElementById("menuToggleGrid").addEventListener("click", toggleGrid);
   document.getElementById("menuToggleAxes").addEventListener("click", toggleAxes);
-  document.getElementById("menuBgBlack").addEventListener("click", () => { setBg("black", scene); setBg("black", cScene); linRows.forEach(r => setBg("black", r.scene)); });
-  document.getElementById("menuBgGradient").addEventListener("click", () => { setBg("gradient", scene); setBg("gradient", cScene); linRows.forEach(r => setBg("gradient", r.scene)); });
-  document.getElementById("menuBgWhite").addEventListener("click", () => { setBg("white", scene); setBg("white", cScene); linRows.forEach(r => setBg("white", r.scene)); });
+  document.getElementById("menuBgBlack").addEventListener("click", () => { currentBgMode="black"; setBg("black", scene); setBg("black", cScene); linRows.forEach(r => setBg("black", r.scene)); });
+  document.getElementById("menuBgGradient").addEventListener("click", () => { currentBgMode="gradient"; setBg("gradient", scene); setBg("gradient", cScene); linRows.forEach(r => setBg("gradient", r.scene)); });
+  document.getElementById("menuBgWhite").addEventListener("click", () => { currentBgMode="white"; setBg("white", scene); setBg("white", cScene); linRows.forEach(r => setBg("white", r.scene)); });
   document.querySelectorAll("[data-view]").forEach(el => el.addEventListener("click", () => setView(el.dataset.view)));
   document.getElementById("menuShortcuts").addEventListener("click", () => document.getElementById("shortcutsModal").classList.add("show"));
   document.getElementById("menuClearClicks").addEventListener("click", clearAllClicks);
@@ -3265,6 +3457,25 @@ function setupMenus() {
 // ═══════════════════════════════════════════════════════════
 // NORMAL / CURVATURE DISPLAY
 // ═══════════════════════════════════════════════════════════
+
+function _fetchRawNormals() {
+  // Background fetch of normals for raw cloud — non-blocking, enables display modes when ready
+  if (!cloudId) return;
+  const cid = cloudId;
+  fetch("/compute_normals", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cloud_id: cid }) })
+  .then(r => r.json()).then(data => {
+    // Make sure the same cloud is still loaded
+    if (cloudId !== cid || !isRawMode) return;
+    if (data.error) return;
+    normalColorsData = decodeArr(data.normal_colors, 'float32');
+    curvatureColorsData = decodeArr(data.curvature_colors, 'float32');
+    normalsComputed = true;
+    updateDisplayMenuChecks();
+    // If user already switched mode, apply it now
+    if (displayMode !== 'white') applyDisplayColors();
+  }).catch(() => {});
+}
 
 function computeNormals() {
   // Fallback: manually request normal computation if not auto-done
@@ -3297,7 +3508,9 @@ function fetchLinearizedDisplayColors() {
 
 function setDisplayMode(mode) {
   if (mode !== 'white' && !normalColorsData) {
-    status("Normals not yet computed — will be available after clustering.");
+    status(isRawMode
+      ? "Normals not available for this file."
+      : "Normals not yet computed — will be available after clustering.");
     return;
   }
   displayMode = mode;
@@ -3316,6 +3529,29 @@ function updateDisplayMenuChecks() {
 }
 
 function applyDisplayColors() {
+  // Raw mode: update rawPoints directly, no rows/isolation to worry about
+  if (isRawMode && rawPoints) {
+    const nPts = rawPoints.geometry.attributes.position.count;
+    let newColors;
+    if (displayMode === 'normal' && normalColorsData) {
+      newColors = normalColorsData;
+    } else if (displayMode === 'curvature' && curvatureColorsData) {
+      newColors = curvatureColorsData;
+    } else {
+      // Apply white tint: multiply base colors by the chosen tint
+      const base = rawWhiteColorsData || new Float32Array(nPts * 3).fill(1.0);
+      newColors = new Float32Array(nPts * 3);
+      for (let i = 0; i < nPts; i++) {
+        newColors[i*3]   = base[i*3]   * whiteTintColor[0];
+        newColors[i*3+1] = base[i*3+1] * whiteTintColor[1];
+        newColors[i*3+2] = base[i*3+2] * whiteTintColor[2];
+      }
+    }
+    rawPoints.geometry.attributes.color.array.set(newColors);
+    rawPoints.geometry.attributes.color.needsUpdate = true;
+    return;
+  }
+
   if (!fullLinPositions) return;
   const nPts = fullLinPositions.length / 3;
   let newColors;
@@ -3325,16 +3561,20 @@ function applyDisplayColors() {
   } else if (displayMode === 'curvature' && curvatureColorsData) {
     newColors = curvatureColorsData;
   } else {
-    // White — default
+    // White with optional tint
     newColors = new Float32Array(nPts * 3);
-    for (let i = 0; i < nPts * 3; i++) newColors[i] = 1.0;
+    for (let i = 0; i < nPts; i++) {
+      newColors[i*3]   = whiteTintColor[0];
+      newColors[i*3+1] = whiteTintColor[1];
+      newColors[i*3+2] = whiteTintColor[2];
+    }
   }
 
   // Update global color arrays
   fullLinColors = new Float32Array(newColors);
   linBaseColors = new Float32Array(newColors);
 
-  // Update mainPoints if visible
+  // Update mainPoints colors (but only write to its buffer — visibility is unchanged)
   if (mainPoints) {
     mainPoints.geometry.attributes.color.array.set(newColors);
     mainPoints.geometry.attributes.color.needsUpdate = true;
@@ -3345,6 +3585,39 @@ function applyDisplayColors() {
     // Rebuild row colors from the global color arrays
     // Each row contains a subset of points — need to re-extract colors
     rebuildRowColors();
+  }
+
+  // If a cluster is currently isolated, re-apply isolation dimming on top of the new colors
+  // so the view doesn't revert to showing the full cloud
+  if (activeIsolatedId !== null) {
+    if (isRowMode && linRows.length > 0) {
+      linRows.forEach(r => {
+        const hasCluster = r.clusterIds.includes(activeIsolatedId);
+        const colAttr = r.points.geometry.attributes.color;
+        const arr = colAttr.array;
+        const n = r.labels.length;
+        if (hasCluster) {
+          for (let i = 0; i < n; i++) {
+            if (r.labels[i] !== activeIsolatedId) {
+              arr[i*3] = 0.0; arr[i*3+1] = 0.0; arr[i*3+2] = 0.0;
+            }
+            // cluster points already have the correct display-mode color from rebuildRowColors
+          }
+        }
+        colAttr.needsUpdate = true;
+      });
+    } else if (mainPoints && linLabels && linBaseColors) {
+      // Single-scene mode: re-apply isolation filter on mainPoints
+      const colAttr = mainPoints.geometry.attributes.color;
+      const arr = colAttr.array;
+      const n = linLabels.length;
+      for (let i = 0; i < n; i++) {
+        if (linLabels[i] !== activeIsolatedId) {
+          arr[i*3] = 0.0; arr[i*3+1] = 0.0; arr[i*3+2] = 0.0;
+        }
+      }
+      colAttr.needsUpdate = true;
+    }
   }
 }
 
@@ -3417,6 +3690,15 @@ function setupToolbar() {
   document.getElementById("tbLighting").addEventListener("click", toggleLighting);
   document.getElementById("tbCylinders").addEventListener("click", toggleDbhCylinders);
   document.getElementById("ptSlider").addEventListener("input", e => setPtSize(parseFloat(e.target.value)));
+  document.getElementById("ptColorPicker").addEventListener("input", e => {
+    const hex = e.target.value;
+    whiteTintColor = [
+      parseInt(hex.slice(1,3),16)/255,
+      parseInt(hex.slice(3,5),16)/255,
+      parseInt(hex.slice(5,7),16)/255,
+    ];
+    if (displayMode === 'white') applyDisplayColors();
+  });
   // Display mode menu items
   document.getElementById("menuDisplayWhite").addEventListener("click", () => setDisplayMode('white'));
   document.getElementById("menuDisplayNormal").addEventListener("click", () => setDisplayMode('normal'));
@@ -3438,10 +3720,132 @@ function onKeyDown(e) {
   }
 }
 
+// Render a scene into an offscreen RenderTarget and return a flipped ImageData.
+// Does NOT touch the live renderer size — safe to call at any time.
+function _renderToImageData(ren, renderFn, w, h) {
+  const rt = new THREE.WebGLRenderTarget(w, h, {
+    minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+    format: THREE.RGBAFormat, type: THREE.UnsignedByteType,
+    antialias: true,
+  });
+  const savedRT = ren.getRenderTarget();
+  const savedVP = new THREE.Vector4(); ren.getViewport(savedVP);
+  const savedScissor = new THREE.Vector4(); ren.getScissor(savedScissor);
+  const savedScissorTest = ren.getScissorTest();
+  const savedAutoClear = ren.autoClear;
+
+  ren.setRenderTarget(rt);
+  ren.setViewport(0, 0, w, h);
+  ren.setScissorTest(false);
+  ren.autoClear = true;
+  ren.setClearColor(0x0a0a12, 1);
+  ren.clear();
+
+  renderFn(ren, w, h);
+
+  // Read raw RGBA pixels
+  const buf = new Uint8Array(w * h * 4);
+  ren.readRenderTargetPixels(rt, 0, 0, w, h, buf);
+
+  // Restore renderer state
+  ren.setRenderTarget(savedRT);
+  ren.setViewport(savedVP.x, savedVP.y, savedVP.z, savedVP.w);
+  ren.setScissor(savedScissor.x, savedScissor.y, savedScissor.z, savedScissor.w);
+  ren.setScissorTest(savedScissorTest);
+  ren.autoClear = savedAutoClear;
+  rt.dispose();
+
+  // WebGL reads pixels bottom-up — flip vertically for canvas (top-down)
+  const flipped = new Uint8ClampedArray(w * h * 4);
+  const rowBytes = w * 4;
+  for (let row = 0; row < h; row++) {
+    const src = (h - 1 - row) * rowBytes;
+    const dst = row * rowBytes;
+    flipped.set(buf.subarray(src, src + rowBytes), dst);
+  }
+  return new ImageData(flipped, w, h);
+}
+
 function screenshot() {
-  renderer.render(scene, camera);
-  const a = document.createElement("a"); a.href = renderer.domElement.toDataURL("image/png");
-  a.download = "pointcloud.png"; a.click(); status("Screenshot saved");
+  const SCALE = 4; // render at 4× the current CSS pixel size
+
+  const mainCanvas = renderer.domElement;
+  const clsCanvas  = cRenderer ? cRenderer.domElement : null;
+
+  const mainW = Math.round(mainCanvas.clientWidth  * SCALE);
+  const mainH = Math.round(mainCanvas.clientHeight * SCALE);
+  const clsW  = clsCanvas ? Math.round(clsCanvas.clientWidth  * SCALE) : 0;
+  const clsH  = clsCanvas ? Math.round(clsCanvas.clientHeight * SCALE) : 0;
+
+  // ── 1. Render main / row view into offscreen target ──────────
+  const mainData = _renderToImageData(renderer, (ren, w, h) => {
+    if (isRowMode && linRows.length > 0) {
+      const nR = linRows.length;
+      // Scale row heights proportionally to the hi-res output height
+      const displayTotalH = linRows.length * effectiveRowHeight() + (linRows.length - 1) * ROW_GAP;
+      const scaleY = h / displayTotalH;
+      const rowHPx  = Math.round(effectiveRowHeight() * scaleY);
+      const gapPx   = Math.round(ROW_GAP * scaleY);
+      ren.setScissorTest(true);
+      ren.autoClear = false;
+      for (let i = 0; i < nR; i++) {
+        const y = h - ((i + 1) * rowHPx + i * gapPx);
+        ren.setViewport(0, Math.round(y), w, rowHPx);
+        ren.setScissor(0,  Math.round(y), w, rowHPx);
+        // Adjust camera aspect for hi-res width
+        const savedAspect = linRows[i].camera.aspect;
+        linRows[i].camera.aspect = w / Math.max(rowHPx, 1);
+        linRows[i].camera.updateProjectionMatrix();
+        ren.render(linRows[i].scene, linRows[i].camera);
+        linRows[i].camera.aspect = savedAspect;
+        linRows[i].camera.updateProjectionMatrix();
+      }
+      ren.setScissorTest(false);
+      ren.autoClear = true;
+    } else {
+      ren.setViewport(0, 0, w, h);
+      // Adjust camera aspect for hi-res canvas
+      const savedAspect = camera.aspect;
+      camera.aspect = w / Math.max(h, 1);
+      camera.updateProjectionMatrix();
+      ren.render(scene, camera);
+      camera.aspect = savedAspect;
+      camera.updateProjectionMatrix();
+    }
+  }, mainW, mainH);
+
+  // ── 2. Render cluster view into offscreen target ──────────────
+  let clsData = null;
+  if (cRenderer && cScene && cCamera && clsW > 0 && clsH > 0) {
+    clsData = _renderToImageData(cRenderer, (ren, w, h) => {
+      const savedAspect = cCamera.aspect;
+      cCamera.aspect = w / Math.max(h, 1);
+      cCamera.updateProjectionMatrix();
+      ren.setViewport(0, 0, w, h);
+      ren.render(cScene, cCamera);
+      cCamera.aspect = savedAspect;
+      cCamera.updateProjectionMatrix();
+    }, clsW, clsH);
+  }
+
+  // ── 3. Composite onto a 2D canvas and download ───────────────
+  const totalW = mainW + (clsData ? clsW : 0);
+  const totalH = Math.max(mainH, clsData ? clsH : 0);
+
+  const out = document.createElement('canvas');
+  out.width = totalW; out.height = totalH;
+  const ctx = out.getContext('2d');
+  ctx.fillStyle = '#0a0a12';
+  ctx.fillRect(0, 0, totalW, totalH);
+  ctx.putImageData(mainData, 0, 0);
+  if (clsData) ctx.putImageData(clsData, mainW, 0);
+
+  const a = document.createElement('a');
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  a.download = `pointcloud_${ts}.png`;
+  a.href = out.toDataURL('image/png');
+  a.click();
+  status('High-resolution screenshot saved');
 }
 
 
@@ -3576,6 +3980,11 @@ function animate() {
 
   updateOrientCube();
   if (cRenderer && cScene && cCamera) cRenderer.render(cScene, cCamera);
+  // Pulse the hover ring continuously
+  if (_hoverRing && _hoverRing.visible) {
+    const t = (performance.now() % 1200) / 1200;
+    _hoverRing.material.opacity = 0.55 + 0.45 * Math.sin(t * Math.PI * 2);
+  }
   fCnt++;
   const now = performance.now();
   if (now - fTime >= 1000) { document.getElementById("fpsEl").textContent = `FPS: ${fCnt}`; fCnt = 0; fTime = now; }

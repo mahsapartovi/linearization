@@ -521,7 +521,10 @@ def upload_raw():
         # Center and subsample for display
         pts_c = (pts - pts_mean).astype(np.float32)
         white_cols = np.ones_like(pts_c, dtype=np.float32)
-        sp, sc, st_total, st_disp, _ = subsample(pts_c, white_cols, 5_000_000)
+        orig_idx = np.arange(len(pts))
+        sp, sc, st_total, st_disp, sub_idx = subsample(pts_c, white_cols, 5_000_000, orig_idx)
+        # Store subsample indices so /compute_normals can return correctly-indexed colors
+        cloud_store[uid]['raw_sub_idx'] = sub_idx  # None means no downsampling was needed
 
         result = {
             'id': uid, 'name': fn, 'meta': meta,
@@ -618,7 +621,7 @@ def recluster():
     data = request.get_json()
     cid = data.get('cloud_id')
     grid_res = float(data.get('grid_resolution', 0.6))
-    overlap = float(data.get('overlap', 0.15))
+    overlap = max(-0.5, min(0.5, float(data.get('overlap', 0.15))))
     if cid not in cloud_store: return jsonify({'error': 'Cloud not found'}), 404
     store = cloud_store[cid]
     pts = store['raw_pts']
@@ -642,7 +645,7 @@ def relinearize():
     """FAST overlap-only update — reuses existing labels, skips clustering entirely."""
     data = request.get_json()
     cid = data.get('cloud_id')
-    overlap = float(data.get('overlap', 0.15))
+    overlap = max(-0.5, min(0.5, float(data.get('overlap', 0.15))))
     if cid not in cloud_store: return jsonify({'error': 'Cloud not found'}), 404
     store = cloud_store[cid]
     store['overlap'] = overlap
@@ -708,7 +711,8 @@ def export_clicks():
 
 @app.route('/compute_normals', methods=['POST'])
 def compute_normals():
-    """Compute normals + curvature. Usually auto-called during clustering, kept as fallback."""
+    """Compute normals + curvature. Usually auto-called during clustering, kept as fallback.
+    In raw mode, returns colors indexed to the raw display subsample."""
     data = request.get_json()
     cid = data.get('cloud_id')
     if cid not in cloud_store:
@@ -717,11 +721,21 @@ def compute_normals():
     try:
         compute_normals_for_cloud(store)
         curv = store['curvature']
+        nc = store['normal_colors']
+        curvc = store['curvature_colors']
+        # If this is a raw (not yet clustered) cloud, return colors indexed to the raw subsample
+        raw_sub_idx = store.get('raw_sub_idx')
+        if store.get('labels') is None and raw_sub_idx is not None:
+            nc_out = nc[raw_sub_idx]
+            curvc_out = curvc[raw_sub_idx]
+        else:
+            nc_out = nc
+            curvc_out = curvc
         return jsonify({
             'status': 'ok',
-            'normal_colors': to_b64(store['normal_colors'].flatten(), np.float32),
-            'curvature_colors': to_b64(store['curvature_colors'].flatten(), np.float32),
-            'num_points': len(store['raw_pts']),
+            'normal_colors': to_b64(nc_out.flatten(), np.float32),
+            'curvature_colors': to_b64(curvc_out.flatten(), np.float32),
+            'num_points': len(nc_out),
             'curvature_min': round(float(curv.min()), 6),
             'curvature_max': round(float(curv.max()), 6),
         })
@@ -837,6 +851,6 @@ def upload_annotation():
 if __name__ == '__main__':
     print("\n" + "="*60)
     print("  Point Cloud Viewer — Clustering + Linearization + Click Export")
-    print("  http://localhost:8000")
+    print("  http://localhost:8080")
     print("="*60 + "\n")
-    app.run(debug=True, host='0.0.0.0', port=8000)
+    app.run(debug=True, host='0.0.0.0', port=8080)
