@@ -333,7 +333,7 @@ def build_response(pts, cols, labels, cluster_colors, n_cls, overlap, meta=None,
             for ti in range(len(trees)):
                 idx = nearest_idx[ti]
                 cluster_id = int(labels[idx]) if idx < len(labels) else -1
-                ann_lin.append({
+                entry = {
                     'x': float(lin_c[idx, 0]),
                     'y': float(lin_c[idx, 1]),
                     'z': float(lin_c[idx, 2]),
@@ -345,7 +345,10 @@ def build_response(pts, cols, labels, cluster_colors, n_cls, overlap, meta=None,
                     'orig_x': trees[ti]['trunk_x'],
                     'orig_y': trees[ti]['trunk_y'],
                     'orig_z': trees[ti]['trunk_z'],
-                })
+                }
+                if trees[ti].get('dbh') is not None:
+                    entry['dbh'] = trees[ti]['dbh']
+                ann_lin.append(entry)
             result['annotation_positions'] = ann_lin
 
     if meta: result['meta'] = meta
@@ -444,7 +447,32 @@ def upload_raw():
                 ann_file.save(ann_path)
                 try:
                     ann_ext = ann_fn.rsplit('.', 1)[1].lower() if '.' in ann_fn else ''
-                    if ann_ext == 'ply':
+
+                    if ann_ext == 'csv':
+                        # CSV annotation: one row per tree with X,Y,Z,DBH columns
+                        import csv
+                        with open(ann_path, 'r') as cf:
+                            reader = csv.DictReader(cf)
+                            # Normalize headers (lowercase, strip)
+                            reader.fieldnames = [h.strip().lower() for h in reader.fieldnames]
+                            tree_id = 0
+                            for row in reader:
+                                tree_id += 1
+                                tx = float(row.get('x', 0))
+                                ty = float(row.get('y', 0))
+                                tz = float(row.get('z', 0))
+                                dbh_val = row.get('dbh', '')
+                                dbh_float = None
+                                if dbh_val and dbh_val.strip():
+                                    try: dbh_float = float(dbh_val.strip())
+                                    except: pass
+                                trees.append({
+                                    'file': ann_fn, 'instance': tree_id,
+                                    'trunk_x': tx, 'trunk_y': ty, 'trunk_z': tz,
+                                    'count': 1, 'dbh': dbh_float,
+                                })
+
+                    elif ann_ext == 'ply':
                         from plyfile import PlyData
                         ply = PlyData.read(ann_path)
                         v = ply['vertex']
@@ -507,7 +535,7 @@ def upload_raw():
         if annotation_info:
             raw_ann = []
             for t in annotation_info['trees']:
-                raw_ann.append({
+                entry = {
                     'x': float(t['trunk_x'] - pts_mean[0]),
                     'y': float(t['trunk_y'] - pts_mean[1]),
                     'z': float(t['trunk_z'] - pts_mean[2]),
@@ -517,7 +545,10 @@ def upload_raw():
                     'orig_x': t['trunk_x'],
                     'orig_y': t['trunk_y'],
                     'orig_z': t['trunk_z'],
-                })
+                }
+                if t.get('dbh') is not None:
+                    entry['dbh'] = t['dbh']
+                raw_ann.append(entry)
             result['annotation'] = {
                 'trees': annotation_info['trees'],
                 'num_trees': annotation_info['num_trees'],
@@ -806,6 +837,6 @@ def upload_annotation():
 if __name__ == '__main__':
     print("\n" + "="*60)
     print("  Point Cloud Viewer — Clustering + Linearization + Click Export")
-    print("  http://localhost:5000")
+    print("  http://localhost:8000")
     print("="*60 + "\n")
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0', port=8000)
