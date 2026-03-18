@@ -38,9 +38,10 @@
   <div class="menu-item"><span class="menu-label">Tools</span>
     <div class="dropdown">
       <div class="dropdown-item" id="menuToolsExport"><span class="si">💾</span> Export Clicks CSV</div>
+      <div class="dropdown-item" id="menuExportAnnotations"><span class="si">📋</span> Export Annotations CSV</div>
       <div class="dropdown-item" id="menuClearClicks"><span class="si">🗑</span> Clear All Clicks</div>
       <div class="dropdown-divider"></div>
-      <div class="dropdown-item" id="menuDbhCalc"><span class="si"></span> DBH Calculation</div>
+      <div class="dropdown-item" id="menuDbhCalc"><span class="si">📏</span> DBH Calculation</div>
     </div>
   </div>
   <div class="menu-item"><span class="menu-label">3D Views</span>
@@ -111,7 +112,7 @@
     </div>
     <div id="dbhPanel" style="display:none;position:absolute;top:40px;right:20px;z-index:20;background:rgba(30,30,30,.95);border:1px solid var(--acc);border-radius:8px;padding:10px;width:220px;backdrop-filter:blur(6px);">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
-        <span style="font-size:11px;font-weight:600;color:var(--tx);"> DBH Calculation</span>
+        <span style="font-size:11px;font-weight:600;color:var(--tx);">📏 DBH Calculation</span>
         <div style="display:flex;gap:3px;">
           <button class="tb" id="btnDbhSave" title="Save DBH & Close" style="color:#0f0;font-size:14px;padding:1px 6px;">✔</button>
           <button class="tb" id="btnDbhClose" title="Cancel & Close" style="color:#f44;font-size:14px;padding:1px 6px;">✘</button>
@@ -167,7 +168,7 @@
     <div class="panel" id="paramsPanel">
       <div class="ph"><span>Parameters</span></div>
       <div class="pb" id="paramsBody">
-        <div class="param-row"><label>eps Parameter:</label><input type="number" id="pEpsParam" value="0.6" step="0.1" min="0.05" max="10"/></div>
+        <div class="param-row"><label>eps Parameter:</label><input type="number" id="pGridRes" value="0.6" step="0.1" min="0.05" max="10"/></div>
         <button class="action-btn" id="btnRecluster">Cluster & Linearize</button>
         <div class="param-divider"></div>
         <div class="param-row"><label>Row Height:</label>
@@ -212,7 +213,7 @@
               <button id="clearAnnBtn" style="display:none;background:none;border:none;color:#f66;cursor:pointer;font-size:14px;" title="Remove">✕</button>
             </div>
             <input type="file" id="annFileInput" accept=".ply,.txt,.csv,.asc,.labels,.ann,.gt" style="display:none" multiple/>
-            <p class="hint" style="margin-top:4px;font-size:10px;">Upload all annotation files.</p>
+            <p class="hint" style="margin-top:4px;font-size:10px;">PLY files with instance labels, or CSV with X,Y,Z,DBH columns. Multiple files supported.</p>
           </div>
           <button class="action-btn" id="btnStartUpload" style="margin-top:10px;padding:8px;font-size:13px;">Upload & Process</button>
         </div>
@@ -249,11 +250,16 @@
   </div>
 </div>
 
-<!-- RIGHT-CLICK CONTEXT MENU -->
+<!-- RIGHT-CLICK CONTEXT MENU (table rows) -->
 <div id="rowContextMenu" style="display:none;position:fixed;z-index:600;background:var(--bg2);border:1px solid var(--bd);border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,.5);min-width:120px;">
   <div class="dropdown-item" id="ctxEdit" style="padding:5px 12px;font-size:11px;">✏️ Edit row</div>
   <div class="dropdown-item" id="ctxAdd" style="padding:5px 12px;font-size:11px;">➕ Add row below</div>
   <div class="dropdown-item" id="ctxDrop" style="padding:5px 12px;font-size:11px;">📥 Move to bottom</div>
+</div>
+
+<!-- RIGHT-CLICK CONTEXT MENU (cylinder) -->
+<div id="cylContextMenu" style="display:none;position:fixed;z-index:600;background:var(--bg2);border:1px solid var(--bd);border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,.5);min-width:140px;">
+  <div class="dropdown-item" id="ctxCylEdit" style="padding:5px 12px;font-size:11px;">✏️ Edit DBH</div>
 </div>
 
 <div id="loadingOverlay"><div class="spinner"></div><p id="loadingText">Processing…</p></div>
