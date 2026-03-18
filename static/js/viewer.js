@@ -244,8 +244,8 @@ function updateRowLabels() {
 
 let fCnt = 0, fTime = performance.now();
 
-// Track last known Eps_Param for detecting real re-cluster need
-let lastEpsParam = 0.6;
+// Track last known grid_res for detecting real re-cluster need
+let lastGridRes = 0.6;
 
 
 // ═══════════════════════════════════════════════════════════
@@ -266,6 +266,7 @@ function init() {
   setupClickExport();
   setupDbh();
   setupContextMenuActions();
+  setupCylinderContextMenu();
   window.addEventListener("resize", onResize);
   document.getElementById("clearIsolation").addEventListener("click", clearIsolation);
   animate();
@@ -401,7 +402,7 @@ function setupMainControls() {
       if (ri && !ri.row.vp.mouseMoved) onRowDoubleClick(e, ri);
     } else if(!mainVP.mouseMoved) onMainDoubleClick(e);
   });
-  el.addEventListener("contextmenu", e=>e.preventDefault());
+  el.addEventListener("contextmenu", e=>{e.preventDefault(); onCylinderRightClick(e);});
   document.addEventListener("keydown", onKeyDown);
 }
 
@@ -1028,10 +1029,36 @@ function exportClicksCSV() {
   status(`Exported ${clickedPoints.length} clicks to CSV (with original XYZ).`);
 }
 
+function exportAnnotationsCSV() {
+  if (!annotationPositions || !annotationPositions.length) {
+    alert("No annotation data to export. Upload annotation PLY files first.");
+    return;
+  }
+  const headers = ['TreeID', 'X', 'Y', 'Z', 'Cluster', 'DBH'];
+  const rows = [headers.join(',')];
+  annotationPositions.forEach(ann => {
+    const treeId = ann.instance !== undefined ? ann.instance : '—';
+    const x = Number(ann.orig_x).toFixed(4);
+    const y = Number(ann.orig_y).toFixed(4);
+    const z = Number(ann.orig_z).toFixed(4);
+    const cluster = ann.cluster !== undefined && ann.cluster >= 0 ? ann.cluster : '';
+    const dbh = ann._dbh || '';
+    rows.push([treeId, x, y, z, cluster, dbh].join(','));
+  });
+  const blob = new Blob([rows.join('\n')], {type: 'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob), link = document.createElement('a');
+  const name = cloudData ? cloudData.name.replace(/\.[^.]+$/, '') : 'annotations';
+  link.href = url; link.download = `${name}_annotations.csv`;
+  document.body.appendChild(link); link.click(); document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+  status(`Exported ${annotationPositions.length} annotations to CSV (TreeID, XYZ, Cluster, DBH).`);
+}
+
 function setupClickExport() {
   document.getElementById("tbExportCSV").addEventListener("click", exportClicksCSV);
   document.getElementById("menuExportCSV").addEventListener("click", exportClicksCSV);
   document.getElementById("menuToolsExport").addEventListener("click", exportClicksCSV);
+  document.getElementById("menuExportAnnotations").addEventListener("click", exportAnnotationsCSV);
 
   // Marker COLOR change — update ALL existing markers
   document.getElementById("markerColor").addEventListener("input", e => {
@@ -1077,6 +1104,7 @@ function setupClickExport() {
 }
 window.getClickedPoints=()=>[...clickedPoints];
 window.exportClicksCSV=exportClicksCSV;
+window.exportAnnotationsCSV=exportAnnotationsCSV;
 
 // ═══════════════════════════════════════════════════════════
 // CLICK LOG — bottom info panel
@@ -1371,6 +1399,154 @@ function filterAnnotationsByCluster(clusterId) {
 
 
 // ═══════════════════════════════════════════════════════════
+// DBH CYLINDERS — visual representation of measured trees
+// ═══════════════════════════════════════════════════════════
+
+let dbhCylinders = [];       // {mesh, annIdx} objects in row scenes
+let dbhCylindersVisible = false;
+let _ctxCylAnnIdx = -1;      // annotation index for cylinder right-click
+
+function buildDbhCylinders() {
+  clearDbhCylinders();
+  if (!annotationPositions || !isRowMode || !linRows.length) return;
+  annotationPositions.forEach((ann, i) => {
+    const dbhStr = ann._dbh;
+    if (!dbhStr) return;
+    const dbh = parseFloat(dbhStr);
+    if (isNaN(dbh) || dbh <= 0) return;
+    const radius = dbh / 2;
+    const height = 2.0; // 2m tall cylinder
+    // Find row for this annotation
+    let targetRow = null;
+    if (ann.cluster !== undefined && ann.cluster >= 0) {
+      for (const r of linRows) { if (r.clusterIds.includes(ann.cluster)) { targetRow = r; break; } }
+    }
+    if (!targetRow) return;
+    // Position in row-local coords
+    const lx = ann.x - targetRow.centerOffset.x;
+    const ly = ann.y - targetRow.centerOffset.y;
+    const lz = ann.z - targetRow.centerOffset.z;
+    // Cylinder at trunk position, bottom at annotation Z - 1.0m
+    const geo = new THREE.CylinderGeometry(radius, radius, height, 16);
+    const mat = new THREE.MeshBasicMaterial({color: 0x8B4513, transparent: true, opacity: 0.5, depthTest: true});
+    const cyl = new THREE.Mesh(geo, mat);
+    // Three.js CylinderGeometry is Y-up, we need Z-up → rotate
+    cyl.rotation.x = Math.PI / 2;
+    cyl.position.set(lx, ly, lz);
+    cyl.userData = { annIdx: i, isCylinder: true };
+    cyl.visible = dbhCylindersVisible;
+    targetRow.scene.add(cyl);
+    dbhCylinders.push({ mesh: cyl, annIdx: i, row: targetRow });
+  });
+}
+
+function clearDbhCylinders() {
+  dbhCylinders.forEach(c => { if (c.mesh.parent) c.mesh.parent.remove(c.mesh); });
+  dbhCylinders = [];
+}
+
+function toggleDbhCylinders() {
+  dbhCylindersVisible = !dbhCylindersVisible;
+  if (dbhCylindersVisible && dbhCylinders.length === 0) buildDbhCylinders();
+  dbhCylinders.forEach(c => {
+    let show = dbhCylindersVisible;
+    if (show && activeIsolatedId !== null) {
+      const ann = annotationPositions[c.annIdx];
+      if (ann && ann.cluster !== activeIsolatedId) show = false;
+    }
+    c.mesh.visible = show;
+  });
+  document.getElementById("tbCylinders").style.background = dbhCylindersVisible ? "#5a3a1a" : "";
+}
+
+function filterCylindersByCluster(clusterId) {
+  if (!dbhCylindersVisible) return;
+  dbhCylinders.forEach(c => {
+    if (clusterId === null) {
+      c.mesh.visible = true;
+    } else {
+      const ann = annotationPositions ? annotationPositions[c.annIdx] : null;
+      c.mesh.visible = ann && ann.cluster === clusterId;
+    }
+  });
+}
+
+function setupCylinderContextMenu() {
+  document.getElementById("ctxCylEdit").addEventListener("click", () => {
+    if (_ctxCylAnnIdx < 0 || !annotationPositions) return;
+    editDbhForTree(_ctxCylAnnIdx);
+  });
+  document.addEventListener("click", () => {
+    document.getElementById("cylContextMenu").style.display = "none";
+  });
+}
+
+function onCylinderRightClick(e) {
+  if (!dbhCylindersVisible || !isRowMode) return;
+  const ri = getRowAtMouse(e.clientX, e.clientY);
+  if (!ri) return;
+  const rect = renderer.domElement.getBoundingClientRect();
+  const mx = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  const my = -((ri.localY) / ri.rowH) * 2 + 1;
+  const rc = new THREE.Raycaster();
+  rc.setFromCamera(new THREE.Vector2(mx, my), ri.row.camera);
+  // Check cylinder meshes in this row
+  const rowCyls = dbhCylinders.filter(c => c.row === ri.row).map(c => c.mesh);
+  if (!rowCyls.length) return;
+  const hits = rc.intersectObjects(rowCyls);
+  if (hits.length > 0) {
+    e.preventDefault();
+    _ctxCylAnnIdx = hits[0].object.userData.annIdx;
+    const menu = document.getElementById("cylContextMenu");
+    menu.style.display = "block";
+    menu.style.left = e.clientX + "px";
+    menu.style.top = e.clientY + "px";
+  }
+}
+
+let _editingDbhAnnIdx = -1;   // track which tree is being edited
+let _editingDbhOldValue = null; // preserve old DBH until save
+
+function editDbhForTree(annIdx) {
+  if (!annotationPositions || annIdx >= annotationPositions.length) return;
+  const ann = annotationPositions[annIdx];
+  _editingDbhAnnIdx = annIdx;
+  _editingDbhOldValue = ann._dbh || null;
+
+  // Hide ONLY this tree's cylinder
+  dbhCylinders.forEach(c => {
+    if (c.annIdx === annIdx) c.mesh.visible = false;
+  });
+
+  // Highlight this tree's row in the table
+  clearEditHighlight();
+  const tbody = document.getElementById("clickLogTbody");
+  tbody.querySelectorAll("tr.ann-row").forEach(tr => {
+    if (parseInt(tr.dataset.annIdx) === annIdx) {
+      tr.style.background = "rgba(255,165,0,.3)";
+      tr.style.outline = "1px solid #f90";
+      tr.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  });
+
+  // If already in sliced top view, stay there — just let user place circle
+  if (dbhTopViewMode && dbhSliceActive) {
+    status(`Editing tree #${ann.instance} — dbl-click to place circle, +/- resize, Enter lock`);
+    return;
+  }
+
+  // Otherwise, isolate cluster and open DBH tool
+  if (ann.cluster !== undefined && ann.cluster >= 0 && activeIsolatedId !== ann.cluster) {
+    isolateCluster(ann.cluster);
+  }
+  setTimeout(() => {
+    openDbhCalc();
+    status(`Editing DBH for tree #${ann.instance} — old DBH: ${_editingDbhOldValue || '—'}`);
+  }, 100);
+}
+
+
+// ═══════════════════════════════════════════════════════════
 // DBH MEASUREMENT — terrain-following ground plane (20x20)
 // ═══════════════════════════════════════════════════════════
 
@@ -1578,6 +1754,26 @@ function closeSliceTool() {
     isolateCluster(dbhSavedClusterId);
   }
   dbhSavedClusterId = null;
+  // If editing a tree's DBH and cancelled, restore the old value
+  if (_editingDbhAnnIdx >= 0 && annotationPositions) {
+    if (_editingDbhOldValue !== null) {
+      annotationPositions[_editingDbhAnnIdx]._dbh = _editingDbhOldValue;
+      const tbody = document.getElementById("clickLogTbody");
+      tbody.querySelectorAll("tr.ann-row").forEach(tr => {
+        if (parseInt(tr.dataset.annIdx) === _editingDbhAnnIdx) {
+          const c = tr.querySelector(".dbh-cell");
+          if (c) c.textContent = _editingDbhOldValue;
+        }
+      });
+    }
+    // Restore the hidden cylinder immediately
+    dbhCylinders.forEach(c => {
+      if (c.annIdx === _editingDbhAnnIdx) c.mesh.visible = dbhCylindersVisible;
+    });
+  }
+  clearEditHighlight();
+  _editingDbhAnnIdx = -1;
+  _editingDbhOldValue = null;
 }
 
 function updateDbhRedPlane() {
@@ -1607,15 +1803,14 @@ function doDbhSlice() {
   if (annotationPositions) {
     annotationPositions.forEach(ann => {
       if (ann.cluster !== activeIsolatedId) return;
-      // ann.x/y/z are in global linearized centered coords
-      // Convert to row-local by subtracting centerOffset
       const lx = ann.x - r.centerOffset.x;
       const ly = ann.y - r.centerOffset.y;
       trunkXYs.push({ x: lx, y: ly });
     });
   }
 
-  const trunkRadius = 0.8; // meters — keep points within this XY distance of a known trunk
+  const hasAnnotations = trunkXYs.length > 0;
+  const trunkRadius = 0.8;
   const trunkRadSq = trunkRadius * trunkRadius;
 
   for(let i=0;i<n;i++){
@@ -1629,16 +1824,21 @@ function doDbhSlice() {
       continue;
     }
 
-    // Check if this point is near any known trunk AND above ground
-    let nearTrunk = false;
-    for(const t of trunkXYs) {
-      const dx = x - t.x, dy = y - t.y;
-      if(dx*dx + dy*dy < trunkRadSq) { nearTrunk = true; break; }
-    }
-
-    // Must be near a trunk AND above ground+0.3m (skip ground surface)
-    if(!nearTrunk || z < gz + 0.3) {
-      arr[i*3]=0; arr[i*3+1]=0; arr[i*3+2]=0;
+    if (hasAnnotations) {
+      // WITH annotations: keep only points near known trunks and above ground
+      let nearTrunk = false;
+      for(const t of trunkXYs) {
+        const dx = x - t.x, dy = y - t.y;
+        if(dx*dx + dy*dy < trunkRadSq) { nearTrunk = true; break; }
+      }
+      if(!nearTrunk || z < gz + 0.3) {
+        arr[i*3]=0; arr[i*3+1]=0; arr[i*3+2]=0;
+      }
+    } else {
+      // WITHOUT annotations: simple ground removal — keep trunk band only
+      if(z < gz + 0.3) {
+        arr[i*3]=0; arr[i*3+1]=0; arr[i*3+2]=0;
+      }
     }
   }
 
@@ -1887,6 +2087,39 @@ function saveAndReturnToCluster() {
     isolateCluster(dbhSavedClusterId);
   }
   dbhSavedClusterId = null;
+  // Update the highlighted row with new DBH value if editing
+  if (_editingDbhAnnIdx >= 0 && annotationPositions) {
+    const newDbh = annotationPositions[_editingDbhAnnIdx]._dbh;
+    if (newDbh) {
+      const tbody = document.getElementById("clickLogTbody");
+      tbody.querySelectorAll("tr.ann-row").forEach(tr => {
+        if (parseInt(tr.dataset.annIdx) === _editingDbhAnnIdx) {
+          const c = tr.querySelector(".dbh-cell");
+          if (c) c.textContent = newDbh;
+          // Flash green to confirm update
+          tr.style.background = "rgba(0,200,80,.4)";
+          tr.style.outline = "1px solid #0c8";
+          setTimeout(() => { tr.style.background = ""; tr.style.outline = ""; }, 1500);
+        }
+      });
+    }
+  }
+  _editingDbhAnnIdx = -1;
+  _editingDbhOldValue = null;
+  // Rebuild cylinders to reflect new/changed DBH values
+  if (dbhCylindersVisible) {
+    buildDbhCylinders();
+    if (activeIsolatedId !== null) filterCylindersByCluster(activeIsolatedId);
+  }
+}
+
+function clearEditHighlight() {
+  const tbody = document.getElementById("clickLogTbody");
+  if (!tbody) return;
+  tbody.querySelectorAll("tr.ann-row").forEach(tr => {
+    tr.style.background = "";
+    tr.style.outline = "";
+  });
 }
 
 function onDbhDoubleClick(ri,e){
@@ -1966,7 +2199,7 @@ function loadCloud(data) {
   fitCameraFront(mainPoints, camera, mainVP);
   fitCamera(clusterPoints, cCamera, clsVP);
   updateDBTree(); showMainProps(); showClusterProps(data.cluster_stats, data.cluster_colors);
-  document.getElementById("pEpsParam").value = lastEpsParam;
+  document.getElementById("pGridRes").value = lastGridRes;
   document.getElementById("pOverlap").value = data.overlap || 0.15;
   document.getElementById("btnRecluster").textContent = "Re-Cluster";
   document.getElementById("btnApplyOverlap").disabled = false;
@@ -1985,10 +2218,14 @@ function loadCloud(data) {
   // Handle annotation positions — show pink markers on annotated tree trunks
   annotationPositions = data.annotation_positions || null;
   if (annotationPositions && annotationPositions.length > 0) {
-    // Initialize per-file visibility
-    annotationPositions.forEach(a => { if (annotationFileVisibility[a.file] === undefined) annotationFileVisibility[a.file] = true; });
+    // Pre-populate _dbh from server data (e.g. CSV annotations with DBH column)
+    annotationPositions.forEach(a => {
+      if (a.dbh !== undefined && a.dbh !== null && !a._dbh) a._dbh = String(a.dbh);
+      if (annotationFileVisibility[a.file] === undefined) annotationFileVisibility[a.file] = true;
+    });
     buildAnnotationMarkers();
     addAnnotationLogEntries(annotationPositions);
+    buildDbhCylinders();
   }
   updateDBTree();  // refresh to show annotation files
 
@@ -2025,6 +2262,7 @@ function loadRawCloud(data) {
   if (data.annotation && data.annotation.raw_positions && data.annotation.raw_positions.length > 0) {
     annotationPositions = data.annotation.raw_positions;
     annotationPositions.forEach(a => {
+      if (a.dbh !== undefined && a.dbh !== null && !a._dbh) a._dbh = String(a.dbh);
       if (annotationFileVisibility[a.file] === undefined) annotationFileVisibility[a.file] = true;
     });
     // Create markers directly in the main scene for raw view
@@ -2170,6 +2408,8 @@ function isolateCluster(clusterId) {
     filterAnnotationsByCluster(clusterId);
     // Filter click log table to show only this cluster's rows
     filterClickLogByCluster(clusterId);
+    // Filter cylinders to show only this cluster
+    filterCylindersByCluster(clusterId);
 
     const col = cloudData.cluster_colors[clusterId];
     const rgb = col ? `rgb(${Math.round(col[0]*255)},${Math.round(col[1]*255)},${Math.round(col[2]*255)})` : '#fff';
@@ -2228,6 +2468,7 @@ function clearIsolation() {
     repositionMarkersInRows();
     filterAnnotationsByCluster(null);  // show all annotations
     filterClickLogByCluster(null);     // show all table rows
+    filterCylindersByCluster(null);    // show all cylinders
     if (cloudData) status(`Showing all — ${cloudData.meta.n_clusters} clusters`);
     return;
   }
@@ -2306,12 +2547,12 @@ function setupRecluster() {
   // Full re-cluster (or first-time clustering from raw mode)
   document.getElementById("btnRecluster").addEventListener("click", () => {
     if (!cloudId) { status("No cloud loaded"); return; }
-    const gr = parseFloat(document.getElementById("pEpsParam").value) || 0.6;
+    const gr = parseFloat(document.getElementById("pGridRes").value) || 0.6;
     const ov = parseFloat(document.getElementById("pOverlap").value) || 0.15;
-    lastEpsParam = gr;
+    lastGridRes = gr;
     showLoading(isRawMode ? "Clustering & linearizing…" : "Re-clustering…");
     fetch("/recluster", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cloud_id: cloudId, eps_param: gr, overlap: ov }) })
+      body: JSON.stringify({ cloud_id: cloudId, grid_resolution: gr, overlap: ov }) })
     .then(r => r.json()).then(d => {
       hideLoading();
       if (d.error) { status("Error: " + d.error); return; }
@@ -2543,6 +2784,8 @@ function clearScene() {
   dbhPlacedCircles=[];
   dbhHiddenPoints = null; dbhSavedCams = {};
   dbhLinesVisible = false; dbhGroundGrids = {};
+  clearDbhCylinders(); dbhCylindersVisible = false;
+  document.getElementById("tbCylinders").style.background = "";
   document.getElementById("isolatedBanner").style.display = "none";
   clearClickLog();
 }
@@ -2658,6 +2901,7 @@ function resetView() {
 
 
 // ═══════════════════════════════════════════════════════════
+// COORD READOUT
 // ═══════════════════════════════════════════════════════════
 
 let _hoveredAnnIdx = -1;
@@ -3171,6 +3415,7 @@ function setupToolbar() {
   //document.getElementById("tbPtDn").addEventListener("click", () => setPtSize(Math.max(0.5, parseFloat(document.getElementById("ptSlider").value) - 0.5)));
   //document.getElementById("tbShot").addEventListener("click", screenshot);
   document.getElementById("tbLighting").addEventListener("click", toggleLighting);
+  document.getElementById("tbCylinders").addEventListener("click", toggleDbhCylinders);
   document.getElementById("ptSlider").addEventListener("input", e => setPtSize(parseFloat(e.target.value)));
   // Display mode menu items
   document.getElementById("menuDisplayWhite").addEventListener("click", () => setDisplayMode('white'));
