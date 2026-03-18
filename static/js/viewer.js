@@ -94,6 +94,7 @@ let annotationFileVisibility = {}; // {filename: true/false}
 let dbhCylinders = [];           // THREE.Mesh cylinders drawn at DBH radius
 let dbhCylindersVisible = false; // toolbar toggle state
 let linInstanceLabels = null;
+let _pendingAnnReplace = -1; // annotation index waiting for replacement position
 
 // Multi-row linearized state
 let linRows = [];              // [{scene, camera, vp, points, labels, origXYZ, clusterIds, baseColors}]
@@ -277,6 +278,7 @@ function init() {
   setupClickExport();
   setupDbh();
   setupContextMenuActions();
+  setupCylinderContextMenu();
   window.addEventListener("resize", onResize);
   document.getElementById("clearIsolation").addEventListener("click", clearIsolation);
   animate();
@@ -415,7 +417,7 @@ function setupMainControls() {
       if (ri && !ri.row.vp.mouseMoved) onRowDoubleClick(e, ri);
     } else if(!mainVP.mouseMoved) onMainDoubleClick(e);
   });
-  el.addEventListener("contextmenu", e=>e.preventDefault());
+  el.addEventListener("contextmenu", e=>{e.preventDefault(); onCylinderRightClick(e);});
   document.addEventListener("keydown", onKeyDown);
 }
 
@@ -845,6 +847,104 @@ function onRowDoubleClick(event, ri) {
   const distance = ri.row.camera.position.distanceTo(ri.row.vp.pivotPoint);
   rc.params.Points.threshold = Math.max(0.005, Math.min(0.3, 0.01 * (distance / 15)));
 
+  // ── Annotation editing: double-click annotation sprite to remove it ──
+  if (_pendingAnnReplace < 0) {
+    const annSprites = annotationMarkers.filter(m => m.parent === ri.row.scene && m.visible);
+    if (annSprites.length > 0) {
+      const rcAnn = new THREE.Raycaster();
+      rcAnn.setFromCamera(new THREE.Vector2(mx, my), ri.row.camera);
+      const annHits = rcAnn.intersectObjects(annSprites);
+      if (annHits.length > 0) {
+        const hitMarker = annHits[0].object;
+        const annIdx = annotationMarkers.indexOf(hitMarker);
+        if (annIdx >= 0 && annIdx < annotationPositions.length) {
+          // Hide marker + cylinder
+          hitMarker.visible = false;
+          dbhCylinders.forEach(c => { if (c.userData.annIdx === annIdx) c.visible = false; });
+          // Grey out table row
+          const tbody = document.getElementById("clickLogTbody");
+          tbody.querySelectorAll("tr.ann-row").forEach(tr => {
+            if (parseInt(tr.dataset.annIdx) === annIdx) {
+              tr.style.opacity = "0.3";
+              tr.style.textDecoration = "line-through";
+            }
+          });
+          _pendingAnnReplace = annIdx;
+          status(`Annotation A${annIdx+1} removed — double-click a new position to replace it`);
+          return;
+        }
+      }
+    }
+  }
+
+  // ── Annotation editing: if pending replacement, use this click as new position ──
+  if (_pendingAnnReplace >= 0) {
+    let intersects = rc.intersectObject(ri.row.points);
+    if (!intersects.length) { rc.params.Points.threshold *= 3; intersects = rc.intersectObject(ri.row.points); }
+    const colAttrRepl = ri.row.points.geometry.attributes.color;
+    const replHit = intersects.find(ix => {
+      if (!colAttrRepl) return true;
+      return (colAttrRepl.getX(ix.index) + colAttrRepl.getY(ix.index) + colAttrRepl.getZ(ix.index)) >= 0.01;
+    });
+    if (replHit) {
+      const pi = replHit.index;
+      const pa = ri.row.points.geometry.attributes.position;
+      const ex = pa.getX(pi), ey = pa.getY(pi), ez = pa.getZ(pi);
+      let origX = '', origY = '', origZ = '';
+      if (ri.row.origXYZ && pi * 3 + 2 < ri.row.origXYZ.length) {
+        origX = ri.row.origXYZ[pi * 3]; origY = ri.row.origXYZ[pi * 3 + 1]; origZ = ri.row.origXYZ[pi * 3 + 2];
+      }
+      const annIdx = _pendingAnnReplace;
+      const ann = annotationPositions[annIdx];
+      // Update annotation position (keep DBH, instance, cluster, file)
+      ann.x = ex + ri.row.centerOffset.x;
+      ann.y = ey + ri.row.centerOffset.y;
+      ann.z = ez + ri.row.centerOffset.z;
+      if (origX !== '') { ann.orig_x = Number(origX); ann.orig_y = Number(origY); ann.orig_z = Number(origZ); }
+      // Determine cluster from point
+      let trueClusterId = -1;
+      if (ri.row.labels && pi < ri.row.labels.length) trueClusterId = ri.row.labels[pi];
+      ann.cluster = trueClusterId;
+      // Move 3D marker to new position
+      const marker = annotationMarkers[annIdx];
+      if (marker) {
+        marker.position.set(ex, ey, ez);
+        const fileVis = annotationFileVisibility[ann.file] !== false;
+        const clusterOk = activeIsolatedId === null || ann.cluster === activeIsolatedId;
+        marker.visible = annotationVisible && fileVis && clusterOk;
+      }
+      // Update table row
+      const tbody = document.getElementById("clickLogTbody");
+      tbody.querySelectorAll("tr.ann-row").forEach(tr => {
+        if (parseInt(tr.dataset.annIdx) === annIdx) {
+          tr.style.opacity = "";
+          tr.style.textDecoration = "";
+          const cells = tr.querySelectorAll("td");
+          if (cells.length >= 4) {
+            cells[1].textContent = ann.orig_x !== undefined ? Number(ann.orig_x).toFixed(3) : '—';
+            cells[2].textContent = ann.orig_y !== undefined ? Number(ann.orig_y).toFixed(3) : '—';
+            cells[3].textContent = ann.orig_z !== undefined ? Number(ann.orig_z).toFixed(3) : '—';
+          }
+          tr.dataset.cluster = ann.cluster;
+          const clCell = tr.querySelector("[data-field='cluster']");
+          if (clCell) clCell.textContent = ann.cluster >= 0 ? ann.cluster : '—';
+          // Flash green
+          tr.style.background = "rgba(0,200,80,.4)";
+          tr.style.outline = "1px solid #0c8";
+          setTimeout(() => { tr.style.background = ""; tr.style.outline = ""; }, 1500);
+        }
+      });
+      // Rebuild cylinders to update position
+      if (dbhCylindersVisible) {
+        buildDbhCylinders();
+        if (activeIsolatedId !== null) filterCylindersByCluster(activeIsolatedId);
+      }
+      _pendingAnnReplace = -1;
+      status(`Annotation A${annIdx+1} repositioned to (${ann.orig_x.toFixed(3)}, ${ann.orig_y.toFixed(3)}, ${ann.orig_z.toFixed(3)})`);
+      return;
+    }
+  }
+
   // Check existing markers in THIS row scene first → remove
   const rowMarkers = clickMarkers.filter(m => m.parent === ri.row.scene);
   if (rowMarkers.length > 0) {
@@ -1175,10 +1275,36 @@ function exportClicksCSV() {
   status(`Exported ${clickedPoints.length} clicks to CSV (with original XYZ).`);
 }
 
+function exportAnnotationsCSV() {
+  if (!annotationPositions || !annotationPositions.length) {
+    alert("No annotation data to export. Upload annotation PLY/CSV files first.");
+    return;
+  }
+  const headers = ['TreeID', 'X', 'Y', 'Z', 'Cluster', 'DBH'];
+  const rows = [headers.join(',')];
+  annotationPositions.forEach(ann => {
+    const treeId = ann.instance !== undefined ? ann.instance : '—';
+    const x = Number(ann.orig_x).toFixed(4);
+    const y = Number(ann.orig_y).toFixed(4);
+    const z = Number(ann.orig_z).toFixed(4);
+    const cluster = ann.cluster !== undefined && ann.cluster >= 0 ? ann.cluster : '';
+    const dbh = ann._dbh || (ann.dbh != null ? Number(ann.dbh).toFixed(4) : '');
+    rows.push([treeId, x, y, z, cluster, dbh].join(','));
+  });
+  const blob = new Blob([rows.join('\n')], {type: 'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob), link = document.createElement('a');
+  const name = cloudData ? cloudData.name.replace(/\.[^.]+$/, '') : 'annotations';
+  link.href = url; link.download = `${name}_annotations.csv`;
+  document.body.appendChild(link); link.click(); document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+  status(`Exported ${annotationPositions.length} annotations to CSV.`);
+}
+
 function setupClickExport() {
   document.getElementById("tbExportCSV").addEventListener("click", exportClicksCSV);
   document.getElementById("menuExportCSV").addEventListener("click", exportClicksCSV);
   document.getElementById("menuToolsExport").addEventListener("click", exportClicksCSV);
+  document.getElementById("menuExportAnnotations").addEventListener("click", exportAnnotationsCSV);
 
   // Marker COLOR change — update ALL existing markers
   document.getElementById("markerColor").addEventListener("input", e => {
@@ -1409,7 +1535,6 @@ function clearClickLog() {
 function clearAnnotationMarkers() {
   annotationMarkers.forEach(m => { if (m.parent) m.parent.remove(m); });
   annotationMarkers = [];
-  clearDbhCylinders();
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1421,11 +1546,21 @@ function clearDbhCylinders() {
   dbhCylinders = [];
 }
 
+function _cylShouldBeVisible(annIdx) {
+  if (!dbhCylindersVisible) return false;
+  if (!annotationPositions || annIdx === undefined || annIdx >= annotationPositions.length) return false;
+  const ann = annotationPositions[annIdx];
+  const fileVis = annotationFileVisibility[ann.file] !== false;
+  if (!fileVis) return false;
+  if (activeIsolatedId !== null && ann.cluster !== activeIsolatedId) return false;
+  return true;
+}
+
 function buildDbhCylinders() {
   clearDbhCylinders();
   if (!annotationPositions || annotationPositions.length === 0) return;
 
-  annotationPositions.forEach(ann => {
+  annotationPositions.forEach((ann, annIdx) => {
     // Prefer tool-measured DBH, fall back to file-provided DBH
     const dbhVal = ann._dbh != null ? ann._dbh : ann.dbh;
     if (dbhVal == null) return;  // no DBH — skip
@@ -1469,7 +1604,8 @@ function buildDbhCylinders() {
     cyl.rotation.x = Math.PI / 2;
     cyl.renderOrder = 2;
     cyl.userData.isDbhCylinder = true;
-    cyl.visible = dbhCylindersVisible && annotationVisible;
+    cyl.userData.annIdx = annIdx;
+    cyl.visible = _cylShouldBeVisible(annIdx);
     targetScene.add(cyl);
     dbhCylinders.push(cyl);
 
@@ -1485,7 +1621,8 @@ function buildDbhCylinders() {
     ring.rotation.copy(cyl.rotation);
     ring.renderOrder = 3;
     ring.userData.isDbhCylinder = true;
-    ring.visible = dbhCylindersVisible && annotationVisible;
+    ring.userData.annIdx = annIdx;
+    ring.visible = _cylShouldBeVisible(annIdx);
     targetScene.add(ring);
     dbhCylinders.push(ring);
   });
@@ -1493,13 +1630,120 @@ function buildDbhCylinders() {
 
 function toggleDbhCylinders() {
   dbhCylindersVisible = !dbhCylindersVisible;
-  dbhCylinders.forEach(m => { m.visible = dbhCylindersVisible && annotationVisible; });
+  // Rebuild cylinders if array is empty (e.g. cleared by scene rebuild)
+  if (dbhCylindersVisible && dbhCylinders.length === 0 && annotationPositions && annotationPositions.length > 0) {
+    buildDbhCylinders();
+  }
+  dbhCylinders.forEach(m => {
+    m.visible = _cylShouldBeVisible(m.userData.annIdx);
+  });
   const btn = document.getElementById('tbCylinders');
   if (btn) btn.classList.toggle('active', dbhCylindersVisible);
   const count = dbhCylinders.length / 2;  // pairs: mesh + ring
   if (dbhCylindersVisible && count === 0) status('No DBH values found on annotations.');
   else if (dbhCylindersVisible) status(`Showing ${count} DBH cylinder(s).`);
   else status('DBH cylinders hidden.');
+}
+
+function filterCylindersByCluster(clusterId) {
+  // Note: activeIsolatedId is already set before this is called
+  dbhCylinders.forEach(m => {
+    m.visible = _cylShouldBeVisible(m.userData.annIdx);
+  });
+}
+
+// ── Edit DBH from cylinder right-click ──
+let _ctxCylAnnIdx = -1;
+let _editingDbhAnnIdx = -1;
+let _editingDbhOldValue = null;
+
+function setupCylinderContextMenu() {
+  document.getElementById("ctxCylEdit").addEventListener("click", () => {
+    if (_ctxCylAnnIdx < 0 || !annotationPositions) return;
+    editDbhForTree(_ctxCylAnnIdx);
+  });
+  document.addEventListener("click", () => {
+    document.getElementById("cylContextMenu").style.display = "none";
+  });
+}
+
+function onCylinderRightClick(e) {
+  if (!dbhCylindersVisible || !isRowMode || !annotationPositions) return;
+  const ri = getRowAtMouse(e.clientX, e.clientY);
+  if (!ri) return;
+  const rect = renderer.domElement.getBoundingClientRect();
+  const mx = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  const my = -((ri.localY) / ri.rowH) * 2 + 1;
+  const rc = new THREE.Raycaster();
+  rc.setFromCamera(new THREE.Vector2(mx, my), ri.row.camera);
+  const rowCyls = dbhCylinders.filter(c => c.parent === ri.row.scene && c.visible);
+  if (!rowCyls.length) return;
+  const hits = rc.intersectObjects(rowCyls);
+  if (hits.length > 0) {
+    e.preventDefault();
+    e.stopPropagation();
+    _ctxCylAnnIdx = hits[0].object.userData.annIdx;
+    const menu = document.getElementById("cylContextMenu");
+    menu.style.display = "block";
+    menu.style.left = e.clientX + "px";
+    menu.style.top = e.clientY + "px";
+  }
+}
+
+function editDbhForTree(annIdx) {
+  if (!annotationPositions || annIdx >= annotationPositions.length) return;
+  const ann = annotationPositions[annIdx];
+  _editingDbhAnnIdx = annIdx;
+  _editingDbhOldValue = ann._dbh || (ann.dbh != null ? String(ann.dbh) : null);
+
+  // Hide ONLY this tree's cylinder pair
+  dbhCylinders.forEach(c => {
+    if (c.userData.annIdx === annIdx) c.visible = false;
+  });
+
+  // Hide ONLY this tree's annotation marker
+  if (annIdx < annotationMarkers.length && annotationMarkers[annIdx]) {
+    annotationMarkers[annIdx].visible = false;
+  }
+
+  // Highlight this tree's row in the table
+  clearEditHighlight();
+  const tbody = document.getElementById("clickLogTbody");
+  tbody.querySelectorAll("tr.ann-row").forEach(tr => {
+    if (parseInt(tr.dataset.annIdx) === annIdx) {
+      tr.style.background = "rgba(255,165,0,.3)";
+      tr.style.outline = "1px solid #f90";
+      tr.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  });
+
+  // If already in sliced top view, stay there
+  if (dbhTopViewMode && dbhSliceActive) {
+    status(`Editing tree #${ann.instance} — dbl-click to place circle, +/- resize, Enter lock`);
+    return;
+  }
+
+  // Otherwise isolate cluster (if needed), open DBH tool, and auto-slice
+  if (ann.cluster !== undefined && ann.cluster >= 0 && activeIsolatedId !== ann.cluster) {
+    isolateCluster(ann.cluster);
+  }
+  setTimeout(() => {
+    openDbhCalc();
+    // Auto-slice at 1.5m with top-down camera immediately
+    setTimeout(() => {
+      doDbhSlice();
+      status(`Editing DBH for tree #${ann.instance} — old DBH: ${_editingDbhOldValue || '—'}. Dbl-click trunk to place circle.`);
+    }, 150);
+  }, 100);
+}
+
+function clearEditHighlight() {
+  const tbody = document.getElementById("clickLogTbody");
+  if (!tbody) return;
+  tbody.querySelectorAll("tr.ann-row").forEach(tr => {
+    tr.style.background = "";
+    tr.style.outline = "";
+  });
 }
 
 function createAnnotationMarker(pos, instanceId) {
@@ -1594,8 +1838,7 @@ function toggleAnnotationVisibility(visible) {
     if (show && activeIsolatedId !== null && ann.cluster !== activeIsolatedId) show = false;
     m.visible = show;
   });
-  // Sync DBH cylinders with global annotation visibility
-  dbhCylinders.forEach(m => { m.visible = dbhCylindersVisible && annotationVisible; });
+  // Cylinders are independent — controlled only by 🌳 toggle
 }
 
 function toggleAnnotationFile(filename, visible) {
@@ -1625,22 +1868,10 @@ function filterAnnotationsByCluster(clusterId) {
       }
     }
   });
-  // Mirror the same filter on DBH cylinders (pairs: mesh + ring per annotation)
-  if (dbhCylinders.length > 0) {
-    // Rebuild a per-annotation index: cylinders are pushed in pairs per annotation that has a DBH
-    // Walk annotationPositions in the same order buildDbhCylinders does and match cylinder pairs
-    let cylIdx = 0;
-    annotationPositions.forEach(ann => {
-      const dbhVal = ann._dbh != null ? ann._dbh : ann.dbh;
-      if (dbhVal == null) return;
-      const fileVis = annotationFileVisibility[ann.file] !== false;
-      const show = dbhCylindersVisible && annotationVisible && fileVis &&
-                   (clusterId === null || ann.cluster === clusterId);
-      // Each annotation with DBH contributes 2 entries (mesh + ring)
-      if (cylIdx < dbhCylinders.length)   { dbhCylinders[cylIdx].visible = show;     cylIdx++; }
-      if (cylIdx < dbhCylinders.length)   { dbhCylinders[cylIdx].visible = show;     cylIdx++; }
-    });
-  }
+  // Mirror the same filter on DBH cylinders
+  dbhCylinders.forEach(m => {
+    m.visible = _cylShouldBeVisible(m.userData.annIdx);
+  });
 }
 
 
@@ -1852,6 +2083,33 @@ function closeSliceTool() {
     isolateCluster(dbhSavedClusterId);
   }
   dbhSavedClusterId = null;
+  // If editing a tree's DBH and cancelled, restore old value and cylinder
+  if (_editingDbhAnnIdx >= 0 && annotationPositions) {
+    if (_editingDbhOldValue !== null) {
+      annotationPositions[_editingDbhAnnIdx]._dbh = _editingDbhOldValue;
+      const tbody = document.getElementById("clickLogTbody");
+      tbody.querySelectorAll("tr.ann-row").forEach(tr => {
+        if (parseInt(tr.dataset.annIdx) === _editingDbhAnnIdx) {
+          const c = tr.querySelector(".dbh-cell");
+          if (c) c.textContent = _editingDbhOldValue;
+        }
+      });
+    }
+    // Restore hidden cylinder
+    dbhCylinders.forEach(c => {
+      if (c.userData.annIdx === _editingDbhAnnIdx) c.visible = _cylShouldBeVisible(_editingDbhAnnIdx);
+    });
+    // Restore hidden annotation marker
+    if (_editingDbhAnnIdx < annotationMarkers.length && annotationMarkers[_editingDbhAnnIdx]) {
+      const ann = annotationPositions[_editingDbhAnnIdx];
+      const fileVis = annotationFileVisibility[ann.file] !== false;
+      const clusterOk = activeIsolatedId === null || ann.cluster === activeIsolatedId;
+      annotationMarkers[_editingDbhAnnIdx].visible = annotationVisible && fileVis && clusterOk;
+    }
+  }
+  clearEditHighlight();
+  _editingDbhAnnIdx = -1;
+  _editingDbhOldValue = null;
 }
 
 function updateDbhRedPlane() {
@@ -1920,7 +2178,7 @@ function doDbhSlice() {
   dbhMeshes.forEach(m=>{m.visible=false;}); dbhRedMeshes.forEach(m=>{m.visible=false;});
   linRows.forEach((row,idx)=>{
     if(!row.clusterIds.includes(activeIsolatedId))return;
-    dbhSavedCams[idx]={pos:row.camera.position.clone(),up:row.camera.up.clone(),target:row.vp.pivotPoint.clone()};
+    if(!dbhTopViewMode) dbhSavedCams[idx]={pos:row.camera.position.clone(),up:row.camera.up.clone(),target:row.vp.pivotPoint.clone()};
     let cxMin=Infinity,cxMax=-Infinity,cyMin=Infinity,cyMax=-Infinity;
     for(let j=0;j<n;j++){
       if(row.labels[j]!==activeIsolatedId)continue;
@@ -2090,6 +2348,15 @@ function setupDbh() {
     dbhSliceOffset=parseFloat(e.target.value);
     document.getElementById("dbhHeightVal").textContent=dbhSliceOffset.toFixed(2)+" m";
     updateDbhRedPlane();
+    // If already in top-view sliced mode, re-slice immediately at new height
+    if (dbhTopViewMode && dbhSliceActive && dbhHiddenPoints && dbhTargetRow) {
+      // Restore original pre-slice colors before re-slicing
+      const c = dbhTargetRow.points.geometry.attributes.color;
+      c.array.set(dbhHiddenPoints);
+      c.needsUpdate = true;
+      dbhHiddenPoints = null;
+      doDbhSlice();
+    }
   });
   document.getElementById("btnDoSlice").addEventListener("click", doDbhSlice);
   document.getElementById("btnCircleShrink").addEventListener("click", ()=>resizeDbhCircle(-1));
@@ -2156,11 +2423,45 @@ function saveAndReturnToCluster() {
     });
     dbhSavedCams={}; dbhTopViewMode=false;
   }
+
+  // Restore the edited tree's annotation marker BEFORE isolateCluster runs
+  // (isolateCluster calls filterAnnotationsByCluster which checks m.visible)
+  if (_editingDbhAnnIdx >= 0 && _editingDbhAnnIdx < annotationMarkers.length && annotationMarkers[_editingDbhAnnIdx]) {
+    const ann = annotationPositions[_editingDbhAnnIdx];
+    const fileVis = annotationFileVisibility[ann.file] !== false;
+    annotationMarkers[_editingDbhAnnIdx].visible = annotationVisible && fileVis;
+  }
+
   // Return to the cluster view we were working on (not clearIsolation)
   if(dbhSavedClusterId !== null) {
     isolateCluster(dbhSavedClusterId);
   }
   dbhSavedClusterId = null;
+
+  // Update highlighted row with new DBH and flash green
+  const savedEditIdx = _editingDbhAnnIdx;
+  if (savedEditIdx >= 0 && annotationPositions) {
+    const newDbh = annotationPositions[savedEditIdx]._dbh;
+    if (newDbh) {
+      const tbody = document.getElementById("clickLogTbody");
+      tbody.querySelectorAll("tr.ann-row").forEach(tr => {
+        if (parseInt(tr.dataset.annIdx) === savedEditIdx) {
+          const c = tr.querySelector(".dbh-cell");
+          if (c) c.textContent = newDbh;
+          tr.style.background = "rgba(0,200,80,.4)";
+          tr.style.outline = "1px solid #0c8";
+          setTimeout(() => { tr.style.background = ""; tr.style.outline = ""; }, 1500);
+        }
+      });
+    }
+  }
+  clearEditHighlight();
+  _editingDbhAnnIdx = -1;
+  _editingDbhOldValue = null;
+
+  // Rebuild cylinders with new DBH values — always rebuild to pick up updated DBH
+  buildDbhCylinders();
+  if (activeIsolatedId !== null) filterCylindersByCluster(activeIsolatedId);
 }
 
 function onDbhDoubleClick(ri,e){
@@ -2462,6 +2763,8 @@ function isolateCluster(clusterId) {
     filterAnnotationsByCluster(clusterId);
     // Filter click log table to show only this cluster's rows
     filterClickLogByCluster(clusterId);
+    // Filter cylinders to only this cluster
+    filterCylindersByCluster(clusterId);
 
     const col = cloudData.cluster_colors[clusterId];
     const rgb = col ? `rgb(${Math.round(col[0]*255)},${Math.round(col[1]*255)},${Math.round(col[2]*255)})` : '#fff';
@@ -2535,6 +2838,7 @@ function clearIsolation() {
     repositionMarkersInRows();
     filterAnnotationsByCluster(null);  // show all annotations
     filterClickLogByCluster(null);     // show all table rows
+    filterCylindersByCluster(null);    // show all cylinders
     if (cloudData) status(`Showing all — ${cloudData.meta.n_clusters} clusters`);
     return;
   }
@@ -2866,6 +3170,11 @@ function clearScene() {
   dbhPlacedCircles=[];
   dbhHiddenPoints = null; dbhSavedCams = {};
   dbhLinesVisible = false; dbhGroundGrids = {};
+  _editingDbhAnnIdx = -1; _editingDbhOldValue = null;
+  _pendingAnnReplace = -1;
+  dbhCylindersVisible = false;
+  const cylBtn = document.getElementById("tbCylinders");
+  if (cylBtn) cylBtn.classList.remove("active");
   document.getElementById("isolatedBanner").style.display = "none";
   clearClickLog();
 }
@@ -2939,8 +3248,18 @@ function fitCameraToClusterInRow(row, clusterId) {
 }
 
 function fitAll() {
-  if (isRowMode && activeIsolatedId === null) {
-    linRows.forEach(r => fitCameraFront(r.points, r.camera, r.vp));
+  if (isRowMode && linRows.length > 0) {
+    if (activeIsolatedId !== null) {
+      // Isolated cluster in row mode — fit the row containing this cluster
+      for (const r of linRows) {
+        if (r.clusterIds.includes(activeIsolatedId)) {
+          fitCameraToClusterInRow(r, activeIsolatedId);
+          break;
+        }
+      }
+    } else {
+      linRows.forEach(r => fitCameraFront(r.points, r.camera, r.vp));
+    }
   } else {
     const pts = getActiveMainTarget();
     if (pts) {
@@ -2961,14 +3280,34 @@ function setView(v) {
     }
     cam.up.copy(up); cam.lookAt(p);
   };
-  if (isRowMode && activeIsolatedId === null) {
-    linRows.forEach(r => applyView(r.camera, r.vp));
+  if (isRowMode && linRows.length > 0) {
+    if (activeIsolatedId !== null) {
+      // Isolated cluster in row mode — apply view to the row containing this cluster
+      for (const r of linRows) {
+        if (r.clusterIds.includes(activeIsolatedId)) {
+          applyView(r.camera, r.vp);
+          break;
+        }
+      }
+    } else {
+      linRows.forEach(r => applyView(r.camera, r.vp));
+    }
   } else applyView(camera, mainVP);
 }
 
 function resetView() {
-  if (isRowMode && activeIsolatedId === null) {
-    linRows.forEach(r => fitCameraFront(r.points, r.camera, r.vp));
+  if (isRowMode && linRows.length > 0) {
+    if (activeIsolatedId !== null) {
+      // Isolated cluster in row mode — reset to front view of the cluster
+      for (const r of linRows) {
+        if (r.clusterIds.includes(activeIsolatedId)) {
+          fitCameraToClusterInRow(r, activeIsolatedId);
+          break;
+        }
+      }
+    } else {
+      linRows.forEach(r => fitCameraFront(r.points, r.camera, r.vp));
+    }
   } else {
     const pts = getActiveMainTarget();
     if (pts) {
@@ -3213,6 +3552,22 @@ window._unhighlightCluster = () => {
 // ═══════════════════════════════════════════════════════════
 
 let _pendingFile = null;  // file selected but not yet uploaded
+let _currentTask = 'task2'; // 'task1' = point cloud only, 'task2' = point cloud + annotation
+
+function openUploadModal(task) {
+  _currentTask = task || 'task2';
+  resetModal();
+  const titleEl = document.getElementById("uploadModalTitle");
+  const annSection = document.getElementById("annotationSection");
+  if (_currentTask === 'task1') {
+    if (titleEl) titleEl.textContent = "Task 1 — Open Point Cloud";
+    if (annSection) annSection.style.display = "none";
+  } else {
+    if (titleEl) titleEl.textContent = "Task 2 — Open Point Cloud + Annotations";
+    if (annSection) annSection.style.display = "";
+  }
+  document.getElementById("uploadModal").classList.add("show");
+}
 
 function setupUpload() {
   const modal = document.getElementById("uploadModal"), zone = document.getElementById("uploadZone"), fi = document.getElementById("fileInput");
@@ -3328,7 +3683,8 @@ function resetModal() {
 // ═══════════════════════════════════════════════════════════
 
 function setupMenus() {
-  document.getElementById("menuOpen").addEventListener("click", () => document.getElementById("uploadModal").classList.add("show"));
+  document.getElementById("menuOpenTask1").addEventListener("click", () => openUploadModal('task1'));
+  document.getElementById("menuOpenTask2").addEventListener("click", () => openUploadModal('task2'));
   document.getElementById("menuExport").addEventListener("click", screenshot);
   document.getElementById("menuCloseAll").addEventListener("click", () => window._clearAll());
   document.getElementById("menuToggleGrid").addEventListener("click", toggleGrid);
@@ -3568,7 +3924,7 @@ function updateColorScaleBar(mode) {
 }
 
 function setupToolbar() {
-  document.getElementById("tbOpen").addEventListener("click", () => document.getElementById("uploadModal").classList.add("show"));
+  document.getElementById("tbOpen").addEventListener("click", () => openUploadModal('task2'));
   // document.getElementById("tbFit").addEventListener("click", fitAll);
   //document.getElementById("tbReset").addEventListener("click", resetView);
   // document.getElementById("tbTop").addEventListener("click", () => setView("top"));
@@ -3596,7 +3952,7 @@ function setupToolbar() {
 
 function onKeyDown(e) {
   if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT") return;
-  if (e.ctrlKey && e.key === "o") { e.preventDefault(); document.getElementById("uploadModal").classList.add("show"); return; }
+  if (e.ctrlKey && e.key === "o") { e.preventDefault(); openUploadModal('task2'); return; }
   switch (e.key) {
     case "f": case "F": fitAll(); break;
     case "r": case "R": resetView(); break;

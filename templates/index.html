@@ -13,7 +13,18 @@
 <div id="menuBar">
   <div class="menu-item"><span class="menu-label">File</span>
     <div class="dropdown">
-      <div class="dropdown-item" id="menuOpen"><span class="si">📂</span> Open Point Cloud…</div>
+      <div class="dropdown-item" style="position:relative;" id="menuTask1Wrap">
+        <span class="si">📋</span> Task 1 ▸
+        <div class="dropdown" style="left:100%;top:0;display:none;" id="menuTask1Sub">
+          <div class="dropdown-item" id="menuOpenTask1"><span class="si">📂</span> Open Point Cloud…</div>
+        </div>
+      </div>
+      <div class="dropdown-item" style="position:relative;" id="menuTask2Wrap">
+        <span class="si">📋</span> Task 2 ▸
+        <div class="dropdown" style="left:100%;top:0;display:none;" id="menuTask2Sub">
+          <div class="dropdown-item" id="menuOpenTask2"><span class="si">📂</span> Open Point Cloud…</div>
+        </div>
+      </div>
       <div class="dropdown-divider"></div>
       <div class="dropdown-item" id="menuExportCSV"><span class="si">💾</span> Export Clicks CSV</div>
       <div class="dropdown-item" id="menuExport"><span class="si">📸</span> Export Screenshot</div>
@@ -183,12 +194,11 @@
       </div>
     </div>
   </div>
-</div>
 
 <!-- UPLOAD MODAL -->
 <div id="uploadModal" class="modal-overlay">
   <div class="modal-box">
-    <div class="mh"><span>Open Point Cloud</span><button class="mc" id="closeModal">✕</button></div>
+    <div class="mh"><span id="uploadModalTitle">Open Point Cloud</span><button class="mc" id="closeModal">✕</button></div>
     <div class="mb">
       <div class="upload-zone" id="uploadZone">
         <div style="font-size:42px;margin-bottom:8px;">☁️</div>
@@ -205,7 +215,7 @@
             <button id="clearFileBtn" style="background:none;border:none;color:#f66;cursor:pointer;font-size:13px;margin-left:auto;" title="Remove">✕</button>
           </div>
           <div style="font-size:11px;color:var(--txd);margin-bottom:8px;">Do you have annotation file(s) for this point cloud?</div>
-          <div class="annotation-section" style="padding:6px 8px;border:1px solid var(--bd);border-radius:4px;background:var(--bg0);">
+          <div class="annotation-section" id="annotationSection" style="padding:6px 8px;border:1px solid var(--bd);border-radius:4px;background:var(--bg0);">
             <label style="font-size:11px;color:var(--txd);display:flex;align-items:center;gap:6px;">
               <span>📋 Annotation / Ground Truth (optional):</span>
             </label>

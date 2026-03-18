@@ -11,6 +11,7 @@ body{font:12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgr
 .menu-item:hover .dropdown{display:block;}
 .dropdown-item{padding:6px 14px;cursor:pointer;font-size:12px;white-space:nowrap;}
 .dropdown-item:hover{background:var(--acc);}
+.dropdown-item:hover>.dropdown{display:block!important;}
 .di-check{display:inline-block;width:14px;margin-right:4px;font-size:10px;color:var(--acc);}
 .dropdown-divider{height:1px;background:var(--bd);margin:2px 0;}
 .si{margin-right:6px;}
