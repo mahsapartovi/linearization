@@ -131,13 +131,7 @@
           <button class="tb" id="btnDbhClose" title="Cancel & Close" style="color:#f44;font-size:14px;padding:1px 6px;">✘</button>
         </div>
       </div>
-      <button class="action-btn secondary" id="btnShowBlackPlane" style="margin:0 0 6px;width:100%;padding:4px;font-size:11px;">📏 Show 1.5m Reference Plane</button>
-      <div style="font-size:10px;color:var(--txd);margin-bottom:4px;">Slice height from ground:</div>
-      <div style="display:flex;align-items:center;gap:4px;margin-bottom:6px;">
-        <input type="range" id="dbhHeightSlider" min="0.3" max="20" step="0.05" value="1.5" style="flex:1;"/>
-        <span id="dbhHeightVal" style="font-size:10px;color:#4fc;min-width:36px;">1.5 m</span>
-      </div>
-      <button class="action-btn" id="btnDoSlice" style="margin:0;width:100%;padding:4px;font-size:11px;">✂ Slice &amp; Top View</button>
+
       <div id="dbhCircleTools" style="display:none;margin-top:8px;border-top:1px solid var(--bd);padding-top:6px;">
         <div style="font-size:10px;color:var(--txd);margin-bottom:4px;">Dbl-click trunk → place circle</div>
         <div style="display:flex;gap:4px;align-items:center;">
@@ -269,9 +263,11 @@
   <div class="dropdown-item" id="ctxDrop" style="padding:5px 12px;font-size:11px;">📥 Move to bottom</div>
 </div>
 
-<!-- RIGHT-CLICK CONTEXT MENU (cylinder) -->
-<div id="cylContextMenu" style="display:none;position:fixed;z-index:600;background:var(--bg2);border:1px solid var(--bd);border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,.5);min-width:140px;">
-  <div class="dropdown-item" id="ctxCylEdit" style="padding:5px 12px;font-size:11px;">✏️ Edit DBH</div>
+<!-- RIGHT-CLICK CONTEXT MENU (annotation sphere / cylinder) -->
+<div id="annContextMenu" style="display:none;position:fixed;z-index:600;background:var(--bg2);border:1px solid var(--bd);border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,.5);min-width:150px;">
+  <div class="dropdown-item" id="ctxAnnAddDbh"    style="display:none;padding:6px 14px;font-size:11px;cursor:pointer;">➕ Add DBH</div>
+  <div class="dropdown-item" id="ctxAnnEditDbh"   style="display:none;padding:6px 14px;font-size:11px;cursor:pointer;">✏️ Edit DBH</div>
+  <div class="dropdown-item" id="ctxAnnRemoveDbh" style="display:none;padding:6px 14px;font-size:11px;cursor:pointer;">🗑️ Remove DBH</div>
 </div>
 
 <div id="loadingOverlay"><div class="spinner"></div><p id="loadingText">Processing…</p></div>

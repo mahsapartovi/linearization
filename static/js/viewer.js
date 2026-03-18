@@ -417,7 +417,7 @@ function setupMainControls() {
       if (ri && !ri.row.vp.mouseMoved) onRowDoubleClick(e, ri);
     } else if(!mainVP.mouseMoved) onMainDoubleClick(e);
   });
-  el.addEventListener("contextmenu", e=>{e.preventDefault(); onCylinderRightClick(e);});
+  el.addEventListener("contextmenu", e=>{e.preventDefault(); onAnnotationRightClick(e);});
   document.addEventListener("keydown", onKeyDown);
 }
 
@@ -1546,9 +1546,17 @@ function clearDbhCylinders() {
   dbhCylinders = [];
 }
 
-function _cylShouldBeVisible(annIdx) {
+function _cylShouldBeVisible(annIdx, clickIdx) {
   if (!dbhCylindersVisible) return false;
-  if (!annotationPositions || annIdx === undefined || annIdx >= annotationPositions.length) return false;
+  // Click-marker cylinder (no annotation)
+  if (annIdx === -1 || annIdx === undefined) {
+    if (clickIdx === undefined || clickIdx < 0 || !clickedPoints[clickIdx]) return false;
+    const ck = clickedPoints[clickIdx];
+    if (activeIsolatedId !== null && ck.clusterId !== activeIsolatedId) return false;
+    return true;
+  }
+  // Annotation cylinder
+  if (!annotationPositions || annIdx >= annotationPositions.length) return false;
   const ann = annotationPositions[annIdx];
   const fileVis = annotationFileVisibility[ann.file] !== false;
   if (!fileVis) return false;
@@ -1558,6 +1566,54 @@ function _cylShouldBeVisible(annIdx) {
 
 function buildDbhCylinders() {
   clearDbhCylinders();
+
+  // ── Click-marker DBH cylinders ────────────────────────────────────────────
+  if (clickedPoints && clickedPoints.length > 0) {
+    clickedPoints.forEach((ck, clickIdx) => {
+      if (ck.dbh == null) return;
+      const radius = Number(ck.dbh) / 2;
+      if (!isFinite(radius) || radius <= 0) return;
+      let targetRow = null;
+      if (!isRawMode && ck.clusterId !== undefined && ck.clusterId >= 0) {
+        for (const r of linRows) {
+          if (r.clusterIds.includes(ck.clusterId)) { targetRow = r; break; }
+        }
+        if (!targetRow && linRows.length > 0) targetRow = linRows[0];
+      }
+      const targetScene = targetRow ? targetRow.scene : scene;
+      // exactX/Y/Z are row-local (same coord system as posAttr)
+      const lx = ck.exactX, ly = ck.exactY, lz = ck.exactZ;
+      const height = 1.0;
+      const color = new THREE.Color(document.getElementById('markerColor').value || '#ff69b4');
+      const geo = new THREE.CylinderGeometry(radius, radius, height, 32, 1, true);
+      const mat = new THREE.MeshBasicMaterial({ color, wireframe: false, transparent: true,
+        opacity: 0.35, side: THREE.DoubleSide, depthWrite: false });
+      const cyl = new THREE.Mesh(geo, mat);
+      cyl.position.set(lx, ly, lz);
+      cyl.rotation.x = Math.PI / 2;
+      cyl.renderOrder = 2;
+      cyl.userData.isDbhCylinder = true;
+      cyl.userData.annIdx = -1;
+      cyl.userData.clickIdx = clickIdx;
+      cyl.visible = _cylShouldBeVisible(-1, clickIdx);
+      targetScene.add(cyl);
+      dbhCylinders.push(cyl);
+      const ringGeo = new THREE.EdgesGeometry(new THREE.CylinderGeometry(radius, radius, height, 32, 1, true));
+      const ringMat = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.85 });
+      const ring = new THREE.LineSegments(ringGeo, ringMat);
+      ring.position.copy(cyl.position);
+      ring.rotation.copy(cyl.rotation);
+      ring.renderOrder = 3;
+      ring.userData.isDbhCylinder = true;
+      ring.userData.annIdx = -1;
+      ring.userData.clickIdx = clickIdx;
+      ring.visible = _cylShouldBeVisible(-1, clickIdx);
+      targetScene.add(ring);
+      dbhCylinders.push(ring);
+    });
+  }
+
+  // ── Annotation DBH cylinders ──────────────────────────────────────────────
   if (!annotationPositions || annotationPositions.length === 0) return;
 
   annotationPositions.forEach((ann, annIdx) => {
@@ -1635,7 +1691,7 @@ function toggleDbhCylinders() {
     buildDbhCylinders();
   }
   dbhCylinders.forEach(m => {
-    m.visible = _cylShouldBeVisible(m.userData.annIdx);
+    m.visible = _cylShouldBeVisible(m.userData.annIdx, m.userData.clickIdx);
   });
   const btn = document.getElementById('tbCylinders');
   if (btn) btn.classList.toggle('active', dbhCylindersVisible);
@@ -1648,46 +1704,387 @@ function toggleDbhCylinders() {
 function filterCylindersByCluster(clusterId) {
   // Note: activeIsolatedId is already set before this is called
   dbhCylinders.forEach(m => {
-    m.visible = _cylShouldBeVisible(m.userData.annIdx);
+    m.visible = _cylShouldBeVisible(m.userData.annIdx, m.userData.clickIdx);
   });
 }
 
-// ── Edit DBH from cylinder right-click ──
-let _ctxCylAnnIdx = -1;
+// ── Annotation right-click context menu (sphere + cylinder) ──
+let _ctxAnnIdx = -1;       // index into annotationPositions (-1 = none)
+let _ctxClickIdx = -1;     // index into clickMarkers/clickedPoints (-1 = none)
+let _annMenuDismissReady = false;
 let _editingDbhAnnIdx = -1;
+let _editingDbhClickIdx = -1;   // click marker being edited (-1 = none)
 let _editingDbhOldValue = null;
 
+function _annHasDbh(annIdx) {
+  if (!annotationPositions || annIdx < 0 || annIdx >= annotationPositions.length) return false;
+  // "Has DBH" means a cylinder is currently drawn for this annotation
+  return dbhCylinders.some(c => c.userData.annIdx === annIdx);
+}
+
+function _clickHasDbh(clickIdx) {
+  if (clickIdx < 0 || clickIdx >= clickedPoints.length) return false;
+  return clickedPoints[clickIdx].dbh != null;
+}
+
 function setupCylinderContextMenu() {
-  document.getElementById("ctxCylEdit").addEventListener("click", () => {
-    if (_ctxCylAnnIdx < 0 || !annotationPositions) return;
-    editDbhForTree(_ctxCylAnnIdx);
+  // "Add DBH" — sphere with no DBH yet
+  document.getElementById("ctxAnnAddDbh").addEventListener("click", () => {
+    document.getElementById("annContextMenu").style.display = "none";
+    if (_ctxClickIdx >= 0) { editDbhForClick(_ctxClickIdx); return; }
+    if (_ctxAnnIdx >= 0 && annotationPositions) editDbhForTree(_ctxAnnIdx);
   });
-  document.addEventListener("click", () => {
-    document.getElementById("cylContextMenu").style.display = "none";
+  // "Edit DBH" — sphere that already has a cylinder
+  document.getElementById("ctxAnnEditDbh").addEventListener("click", () => {
+    document.getElementById("annContextMenu").style.display = "none";
+    if (_ctxClickIdx >= 0) { editDbhForClick(_ctxClickIdx); return; }
+    if (_ctxAnnIdx >= 0 && annotationPositions) editDbhForTree(_ctxAnnIdx);
+  });
+  // "Remove DBH" — delete the cylinder and clear the dbh value
+  document.getElementById("ctxAnnRemoveDbh").addEventListener("click", () => {
+    document.getElementById("annContextMenu").style.display = "none";
+    if (_ctxClickIdx >= 0) { removeDbhForClick(_ctxClickIdx); return; }
+    if (_ctxAnnIdx >= 0 && annotationPositions) removeDbhForTree(_ctxAnnIdx);
+  });
+  // Dismiss menu on click outside — use 'click' (not 'mousedown') so menu item
+  // click events always fire first before the menu is hidden.
+  document.addEventListener("click", (ev) => {
+    if (!_annMenuDismissReady) return;
+    const menu = document.getElementById("annContextMenu");
+    // If the click was inside the menu, let the item handler deal with it
+    if (menu.contains(ev.target)) return;
+    menu.style.display = "none";
+    _annMenuDismissReady = false;
+  });
+  document.addEventListener("contextmenu", () => {
+    // Reset dismiss guard on any new right-click so the menu can reopen
+    _annMenuDismissReady = false;
   });
 }
 
-function onCylinderRightClick(e) {
-  if (!dbhCylindersVisible || !isRowMode || !annotationPositions) return;
-  const ri = getRowAtMouse(e.clientX, e.clientY);
-  if (!ri) return;
+function _showAnnotationContextMenu(hasDbh, clientX, clientY) {
+  document.getElementById("ctxAnnAddDbh").style.display    = hasDbh ? "none" : "block";
+  document.getElementById("ctxAnnEditDbh").style.display   = hasDbh ? "block" : "none";
+  document.getElementById("ctxAnnRemoveDbh").style.display = hasDbh ? "block" : "none";
+  const menu = document.getElementById("annContextMenu");
+  menu.style.left = clientX + "px";
+  menu.style.top  = clientY + "px";
+  menu.style.display = "block";
+  // Allow dismiss on next non-right-click (use a tick delay to avoid same-event close)
+  requestAnimationFrame(() => { _annMenuDismissReady = true; });
+}
+
+function onAnnotationRightClick(e) {
+  // Reset context indices for this right-click
+  _ctxAnnIdx = -1;
+  _ctxClickIdx = -1;
+
+  // ── Row mode ──────────────────────────────────────────────
+  if (isRowMode && linRows.length > 0) {
+    const ri = getRowAtMouse(e.clientX, e.clientY);
+    if (!ri) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    const mx = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    const my = -((ri.localY) / ri.rowH) * 2 + 1;
+    const rc = new THREE.Raycaster();
+    rc.setFromCamera(new THREE.Vector2(mx, my), ri.row.camera);
+
+    // 1. DBH cylinders — screen-space projected-circle pick (accurate from any angle)
+    const visCyls = dbhCylinders.filter(c => c.parent === ri.row.scene && c.visible);
+    if (visCyls.length) {
+      const rect2 = renderer.domElement.getBoundingClientRect();
+      const hit = _pickNearestCylinder(visCyls, mx, my, ri.row.camera, rect2.width, ri.rowH);
+      if (hit) {
+        e.stopPropagation();
+        if (hit.annIdx >= 0) {
+          _ctxAnnIdx = hit.annIdx;
+          _showAnnotationContextMenu(_annHasDbh(_ctxAnnIdx), e.clientX, e.clientY);
+        } else {
+          _ctxClickIdx = hit.clickIdx;
+          _showAnnotationContextMenu(_clickHasDbh(_ctxClickIdx), e.clientX, e.clientY);
+        }
+        return;
+      }
+    }
+
+    // 2. Click markers (red spheres placed by double-click)
+    const rowClickMarkers = clickMarkers.filter(m => m.parent === ri.row.scene && m.visible);
+    if (rowClickMarkers.length) {
+      const hits = rc.intersectObjects(rowClickMarkers, true);
+      if (hits.length > 0) {
+        let hit = hits[0].object;
+        while (hit.parent && !hit.userData.isClickMarker) hit = hit.parent;
+        const idx = clickMarkers.indexOf(hit);
+        if (idx !== -1) {
+          e.stopPropagation();
+          _ctxClickIdx = idx;
+          _showAnnotationContextMenu(_clickHasDbh(idx), e.clientX, e.clientY);
+          return;
+        }
+      }
+    }
+
+    // 3. Annotation sprites — screen-space proximity pick
+    if (annotationPositions && annotationPositions.length > 0) {
+      const visMarkers = annotationMarkers.filter(m => m.parent === ri.row.scene && m.visible);
+      if (visMarkers.length) {
+        const dist = ri.row.camera.position.distanceTo(ri.row.vp.pivotPoint);
+        const fovRad = ri.row.camera.fov * Math.PI / 180;
+        const halfH = Math.tan(fovRad / 2);
+        const ndcPerPx = (2 * halfH * dist) / ri.rowH;
+        const threshold = Math.min(0.35, Math.max(0.04, ndcPerPx * 30));
+        const hitMarker = _pickNearestSprite(visMarkers, ri, mx, my, threshold);
+        if (hitMarker !== null) {
+          e.stopPropagation();
+          _ctxAnnIdx = annotationMarkers.indexOf(hitMarker);
+          _showAnnotationContextMenu(_annHasDbh(_ctxAnnIdx), e.clientX, e.clientY);
+          return;
+        }
+      }
+    }
+    return;
+  }
+
+  // ── Single / main-view mode ───────────────────────────────
+  if (!mainPoints && !rawPoints) return;
   const rect = renderer.domElement.getBoundingClientRect();
   const mx = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-  const my = -((ri.localY) / ri.rowH) * 2 + 1;
+  const my = -((e.clientY - rect.top) / rect.height) * 2 + 1;
   const rc = new THREE.Raycaster();
-  rc.setFromCamera(new THREE.Vector2(mx, my), ri.row.camera);
-  const rowCyls = dbhCylinders.filter(c => c.parent === ri.row.scene && c.visible);
-  if (!rowCyls.length) return;
-  const hits = rc.intersectObjects(rowCyls);
-  if (hits.length > 0) {
-    e.preventDefault();
-    e.stopPropagation();
-    _ctxCylAnnIdx = hits[0].object.userData.annIdx;
-    const menu = document.getElementById("cylContextMenu");
-    menu.style.display = "block";
-    menu.style.left = e.clientX + "px";
-    menu.style.top = e.clientY + "px";
+  rc.setFromCamera(new THREE.Vector2(mx, my), camera);
+
+  // Cylinders in main scene — screen-space projected-circle pick
+  const visCylsM = dbhCylinders.filter(c => c.parent === scene && c.visible);
+  if (visCylsM.length) {
+    const hit = _pickNearestCylinder(visCylsM, mx, my, camera, rect.width, rect.height);
+    if (hit) {
+      e.stopPropagation();
+      if (hit.annIdx >= 0) {
+        _ctxAnnIdx = hit.annIdx;
+        _showAnnotationContextMenu(_annHasDbh(_ctxAnnIdx), e.clientX, e.clientY);
+      } else {
+        _ctxClickIdx = hit.clickIdx;
+        _showAnnotationContextMenu(_clickHasDbh(_ctxClickIdx), e.clientX, e.clientY);
+      }
+      return;
+    }
   }
+
+  // Click markers in main scene
+  const mainClickMarkers = clickMarkers.filter(m => m.parent === scene && m.visible);
+  if (mainClickMarkers.length) {
+    const hits = rc.intersectObjects(mainClickMarkers, true);
+    if (hits.length > 0) {
+      let hit = hits[0].object;
+      while (hit.parent && !hit.userData.isClickMarker) hit = hit.parent;
+      const idx = clickMarkers.indexOf(hit);
+      if (idx !== -1) {
+        e.stopPropagation();
+        _ctxClickIdx = idx;
+        _showAnnotationContextMenu(_clickHasDbh(idx), e.clientX, e.clientY);
+        return;
+      }
+    }
+  }
+
+  // Annotation sprites in main scene
+  if (annotationPositions && annotationPositions.length > 0) {
+    const visMarkers = annotationMarkers.filter(m => m.parent === scene && m.visible);
+    if (visMarkers.length) {
+      const dist = camera.position.distanceTo(mainVP.pivotPoint);
+      const fovRad = camera.fov * Math.PI / 180;
+      const halfH = Math.tan(fovRad / 2);
+      const ndcPerPx = (2 * halfH * dist) / rect.height;
+      const threshold = Math.min(0.35, Math.max(0.04, ndcPerPx * 30));
+      const hitMarker = _pickNearestSprite(visMarkers, null, mx, my, threshold, camera);
+      if (hitMarker !== null) {
+        e.stopPropagation();
+        _ctxAnnIdx = annotationMarkers.indexOf(hitMarker);
+        _showAnnotationContextMenu(_annHasDbh(_ctxAnnIdx), e.clientX, e.clientY);
+      }
+    }
+  }
+}
+
+// Screen-space cylinder picker — returns the best-matching { annIdx, clickIdx } or null.
+// Projects each visible DBH cylinder's centre to NDC, converts its physical radius to
+// NDC units at that depth, and picks the nearest cylinder whose projected circle contains
+// the mouse click.  This is robust from any view angle (top-down, oblique, side-on).
+// visCyls  – array of THREE.Mesh/LineSegments from dbhCylinders that are in the right scene
+// ndcX/Y   – mouse position in NDC [-1,1]
+// cam      – the camera to project with
+// vpW/vpH  – viewport pixel dimensions (used for aspect-corrected pixel distance)
+function _pickNearestCylinder(visCyls, ndcX, ndcY, cam, vpW, vpH) {
+  // Build a de-duplicated list of unique cylinder entries (mesh + ring share the same
+  // position/radius metadata, so we only need one per annIdx/clickIdx pair).
+  const seen = new Map();   // key: "ann_N" or "clk_N"  →  { center, radius, annIdx, clickIdx }
+  visCyls.forEach(obj => {
+    const aIdx = obj.userData.annIdx;
+    const cIdx = obj.userData.clickIdx ?? -1;
+    const key = aIdx >= 0 ? `ann_${aIdx}` : `clk_${cIdx}`;
+    if (seen.has(key)) return;
+    // Physical radius comes from the geometry bounding sphere radius projected on XZ
+    // (cylinder is rotated π/2 about X so its axis → Z).  The geometry radius stored
+    // in the bounding sphere is the circumradius of the disc, which IS the DBH radius.
+    let radius = 0;
+    if (obj.geometry) {
+      if (!obj.geometry.boundingSphere) obj.geometry.computeBoundingSphere();
+      // For an open CylinderGeometry rotated x=π/2, the bounding sphere radius ≈
+      // sqrt(r² + (h/2)²).  We want just r, so retrieve it from DBH data directly.
+      if (aIdx >= 0 && annotationPositions && annotationPositions[aIdx]) {
+        const ann = annotationPositions[aIdx];
+        const dbhVal = ann._dbh != null ? ann._dbh : ann.dbh;
+        if (dbhVal != null) radius = Number(dbhVal) / 2;
+      } else if (cIdx >= 0 && clickedPoints && clickedPoints[cIdx] && clickedPoints[cIdx].dbh != null) {
+        radius = Number(clickedPoints[cIdx].dbh) / 2;
+      }
+    }
+    seen.set(key, { center: obj.position.clone(), radius, annIdx: aIdx, clickIdx: cIdx });
+  });
+
+  const aspect = vpW / vpH;
+  let best = null, bestDist = Infinity;
+
+  seen.forEach(entry => {
+    const ndc = entry.center.clone().project(cam);
+    if (ndc.z > 1) return;   // behind camera
+
+    // Convert physical radius to NDC units at this depth.
+    // Project a point offset by `radius` in world X, compare NDC distance.
+    const offPt = entry.center.clone();
+    offPt.x += entry.radius;
+    const offNdc = offPt.project(cam);
+    const radiusNdcX = Math.abs(offNdc.x - ndc.x);
+    // Also try Y offset for robustness (e.g. vertical cylinder axis)
+    const offPtY = entry.center.clone();
+    offPtY.y += entry.radius;
+    const offNdcY = offPtY.project(cam);
+    const radiusNdcY = Math.abs(offNdcY.y - ndc.y);
+    // Use the larger projected radius (most permissive for oblique views)
+    const radiusNdc = Math.max(radiusNdcX, radiusNdcY, 0.01);
+
+    // Pixel-space distance from mouse to cylinder centre (aspect-corrected)
+    const dx = (ndcX - ndc.x) * aspect;
+    const dy = (ndcY - ndc.y);
+    const distNdc = Math.sqrt(dx * dx + dy * dy);
+
+    // Hit if within the projected disc radius (plus a small fixed tolerance in NDC)
+    const tolerance = 0.02;
+    if (distNdc <= radiusNdc + tolerance && distNdc < bestDist) {
+      bestDist = distNdc;
+      best = entry;
+    }
+  });
+
+  return best;   // null if no hit
+}
+
+// ri is the row info object (provides ri.row.camera); pass null + camOverride for main-view use.
+function _pickNearestSprite(sprites, ri, ndcX, ndcY, maxNDC, camOverride) {
+  const cam = camOverride || (ri && ri.row.camera);
+  if (!cam) return null;
+  let best = null, bestD = Infinity;
+  sprites.forEach(sp => {
+    const wp = sp.position.clone();
+    wp.project(cam);
+    const dx = wp.x - ndcX;
+    const dy = wp.y - ndcY;
+    const d = Math.sqrt(dx * dx + dy * dy);
+    if (d < maxNDC && d < bestD) { bestD = d; best = sp; }
+  });
+  return best;
+}
+
+function removeDbhForTree(annIdx) {
+  if (!annotationPositions || annIdx < 0 || annIdx >= annotationPositions.length) return;
+  const ann = annotationPositions[annIdx];
+  // Clear DBH values
+  ann._dbh = null;
+  ann.dbh  = null;
+  // Remove this annotation's cylinder pair from the scene
+  const toRemove = dbhCylinders.filter(c => c.userData.annIdx === annIdx);
+  toRemove.forEach(c => { if (c.parent) c.parent.remove(c); });
+  dbhCylinders = dbhCylinders.filter(c => c.userData.annIdx !== annIdx);
+  // Update the DBH cell in the log table
+  const tbody = document.getElementById("clickLogTbody");
+  tbody.querySelectorAll("tr.ann-row").forEach(tr => {
+    if (parseInt(tr.dataset.annIdx) === annIdx) {
+      const dbhCell = tr.querySelector(".dbh-cell");
+      if (dbhCell) dbhCell.textContent = "—";
+    }
+  });
+  status(`DBH removed for tree #${ann.instance}.`);
+}
+
+// ── DBH for click markers (user-placed red spheres) ──────────────────────
+// click markers live in clickMarkers[] / clickedPoints[] — separate from annotationPositions
+
+function editDbhForClick(clickIdx) {
+  if (clickIdx < 0 || clickIdx >= clickedPoints.length) return;
+  const click = clickedPoints[clickIdx];
+  _editingDbhClickIdx = clickIdx;
+  _editingDbhAnnIdx = -1;
+  _editingDbhOldValue = click.dbh != null ? String(click.dbh) : null;
+
+  // Dim the click marker itself so it's not confused with the new circle
+  const marker = clickMarkers[clickIdx];
+  if (marker) marker.visible = false;
+
+  // For Edit mode: dim existing cylinders for this click, highlight them slightly
+  dbhCylinders.forEach(c => {
+    if (c.userData.clickIdx === clickIdx) {
+      // Highlight by boosting opacity before hiding (user sees flash)
+      c.visible = false;
+    }
+  });
+
+  // Highlight the click log row
+  clearEditHighlight();
+  const tbody = document.getElementById("clickLogTbody");
+  tbody.querySelectorAll("tr.click-row").forEach(tr => {
+    if (parseInt(tr.dataset.clickId) === click.id) {
+      tr.style.background = "rgba(255,165,0,.3)";
+      tr.style.outline = "1px solid #f90";
+      tr.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  });
+
+  if (dbhTopViewMode && dbhSliceActive) {
+    status(`Editing click #${click.id} — dbl-click trunk to place circle, +/- resize, Enter lock`);
+    return;
+  }
+
+  const clusterId = click.clusterId;
+  if (clusterId !== undefined && clusterId >= 0 && activeIsolatedId !== clusterId) {
+    isolateCluster(clusterId);
+  }
+  setTimeout(() => {
+    openDbhCalc();
+    setTimeout(() => {
+      doDbhSlice();
+      status(`${_editingDbhOldValue ? 'Editing' : 'Adding'} DBH for click #${click.id} — dbl-click trunk to place circle.`);
+    }, 150);
+  }, 100);
+}
+
+function removeDbhForClick(clickIdx) {
+  if (clickIdx < 0 || clickIdx >= clickedPoints.length) return;
+  const click = clickedPoints[clickIdx];
+  click.dbh = null;
+  // Remove any cylinder tagged for this click marker
+  const toRemove = dbhCylinders.filter(c => c.userData.clickIdx === clickIdx);
+  toRemove.forEach(c => { if (c.parent) c.parent.remove(c); });
+  dbhCylinders = dbhCylinders.filter(c => c.userData.clickIdx !== clickIdx);
+  // Update the DBH cell in the log table
+  const tbody = document.getElementById("clickLogTbody");
+  tbody.querySelectorAll("tr.click-row").forEach(tr => {
+    if (parseInt(tr.dataset.clickId) === click.id) {
+      const dbhCell = tr.querySelector(".dbh-cell");
+      if (dbhCell) dbhCell.textContent = "—";
+    }
+  });
+  autoSaveClicks();
+  status(`DBH removed for click #${click.id}.`);
 }
 
 function editDbhForTree(annIdx) {
@@ -1740,7 +2137,7 @@ function editDbhForTree(annIdx) {
 function clearEditHighlight() {
   const tbody = document.getElementById("clickLogTbody");
   if (!tbody) return;
-  tbody.querySelectorAll("tr.ann-row").forEach(tr => {
+  tbody.querySelectorAll("tr.ann-row, tr.click-row").forEach(tr => {
     tr.style.background = "";
     tr.style.outline = "";
   });
@@ -1870,7 +2267,7 @@ function filterAnnotationsByCluster(clusterId) {
   });
   // Mirror the same filter on DBH cylinders
   dbhCylinders.forEach(m => {
-    m.visible = _cylShouldBeVisible(m.userData.annIdx);
+    m.visible = _cylShouldBeVisible(m.userData.annIdx, m.userData.clickIdx);
   });
 }
 
@@ -2097,7 +2494,7 @@ function closeSliceTool() {
     }
     // Restore hidden cylinder
     dbhCylinders.forEach(c => {
-      if (c.userData.annIdx === _editingDbhAnnIdx) c.visible = _cylShouldBeVisible(_editingDbhAnnIdx);
+      if (c.userData.annIdx === _editingDbhAnnIdx) c.visible = _cylShouldBeVisible(c.userData.annIdx, c.userData.clickIdx);
     });
     // Restore hidden annotation marker
     if (_editingDbhAnnIdx < annotationMarkers.length && annotationMarkers[_editingDbhAnnIdx]) {
@@ -2107,8 +2504,18 @@ function closeSliceTool() {
       annotationMarkers[_editingDbhAnnIdx].visible = annotationVisible && fileVis && clusterOk;
     }
   }
+  // If editing a click marker's DBH and cancelled, restore click marker visibility
+  if (_editingDbhClickIdx >= 0 && _editingDbhClickIdx < clickMarkers.length) {
+    const marker = clickMarkers[_editingDbhClickIdx];
+    if (marker) marker.visible = true;
+    // Restore existing cylinders for this click
+    dbhCylinders.forEach(c => {
+      if (c.userData.clickIdx === _editingDbhClickIdx) c.visible = dbhCylindersVisible;
+    });
+  }
   clearEditHighlight();
   _editingDbhAnnIdx = -1;
+  _editingDbhClickIdx = -1;
   _editingDbhOldValue = null;
 }
 
@@ -2133,44 +2540,52 @@ function doDbhSlice() {
   dbhHiddenPoints=new Float32Array(colAttr.array);
   const arr=colAttr.array;
 
-  // Build list of tree trunk XY positions in row-local coordinates
+  // Build list of tree trunk XY positions (row-local coords, same as posAttr)
   // from annotations belonging to this cluster
   const trunkXYs = [];
   if (annotationPositions) {
     annotationPositions.forEach(ann => {
       if (ann.cluster !== activeIsolatedId) return;
-      // ann.x/y/z are in global linearized centered coords
-      // Convert to row-local by subtracting centerOffset
-      const lx = ann.x - r.centerOffset.x;
-      const ly = ann.y - r.centerOffset.y;
-      trunkXYs.push({ x: lx, y: ly });
+      // ann.x/y are global lin-centered; subtract centerOffset to get row-local
+      trunkXYs.push({ x: ann.x - r.centerOffset.x, y: ann.y - r.centerOffset.y });
     });
   }
+  // If no annotation trunks, fall back to the click marker being edited (exactX/Y are row-local)
+  if (trunkXYs.length === 0 && _editingDbhClickIdx >= 0 && clickedPoints[_editingDbhClickIdx]) {
+    const ck = clickedPoints[_editingDbhClickIdx];
+    trunkXYs.push({ x: ck.exactX, y: ck.exactY });
+  }
 
-  const trunkRadius = 0.8; // meters — keep points within this XY distance of a known trunk
+  const trunkRadius = 0.8; // metres — keep points within this XY distance of a known trunk
   const trunkRadSq = trunkRadius * trunkRadius;
+  const filterByTrunk = trunkXYs.length > 0;
 
   for(let i=0;i<n;i++){
     if(r.labels[i]!==activeIsolatedId) continue;
     const x=posAttr.getX(i), y=posAttr.getY(i), z=posAttr.getZ(i);
     const gz=getGroundZ(grid, x, y);
 
-    // Always hide points above slice
+    // Always hide points above the slice height
     if(z > gz + dbhSliceOffset) {
       arr[i*3]=0; arr[i*3+1]=0; arr[i*3+2]=0;
       continue;
     }
 
-    // Check if this point is near any known trunk AND above ground
-    let nearTrunk = false;
-    for(const t of trunkXYs) {
-      const dx = x - t.x, dy = y - t.y;
-      if(dx*dx + dy*dy < trunkRadSq) { nearTrunk = true; break; }
-    }
-
-    // Must be near a trunk AND above ground+0.3m (skip ground surface)
-    if(!nearTrunk || z < gz + 0.3) {
-      arr[i*3]=0; arr[i*3+1]=0; arr[i*3+2]=0;
+    if (filterByTrunk) {
+      // Only keep points near a known trunk AND above ground surface
+      let nearTrunk = false;
+      for(const t of trunkXYs) {
+        const dx = x - t.x, dy = y - t.y;
+        if(dx*dx + dy*dy < trunkRadSq) { nearTrunk = true; break; }
+      }
+      if(!nearTrunk || z < gz + 0.3) {
+        arr[i*3]=0; arr[i*3+1]=0; arr[i*3+2]=0;
+      }
+    } else {
+      // No trunk reference — show entire cluster cross-section above ground
+      if(z < gz + 0.3) {
+        arr[i*3]=0; arr[i*3+1]=0; arr[i*3+2]=0;
+      }
     }
   }
 
@@ -2197,7 +2612,50 @@ function doDbhSlice() {
   });
   dbhTopViewMode=true;
   document.getElementById("dbhCircleTools").style.display="block";
-  status("Top view — dbl-click each trunk, +/− resize, Enter to lock, dbl-click next. ✔ saves all.");
+
+  // Auto-place circle on entry:
+  // • Edit mode  → use existing DBH position + radius
+  // • Add mode   → place at the marker's trunk position with a default radius
+  let editCenter = null;
+  let editRadius = null;
+  if (_editingDbhAnnIdx >= 0 && annotationPositions && annotationPositions[_editingDbhAnnIdx]) {
+    const ann = annotationPositions[_editingDbhAnnIdx];
+    const dbhVal = ann._dbh != null ? ann._dbh : ann.dbh;
+    const r = dbhTargetRow;
+    // For Edit: use existing DBH value; for Add: just use the trunk centre
+    editRadius = dbhVal != null ? Number(dbhVal) / 2 : null;
+    if (r) {
+      editCenter = new THREE.Vector3(
+        ann.x - r.centerOffset.x,
+        ann.y - r.centerOffset.y,
+        ann.z - r.centerOffset.z
+      );
+    }
+  } else if (_editingDbhClickIdx >= 0 && clickedPoints[_editingDbhClickIdx]) {
+    const ck = clickedPoints[_editingDbhClickIdx];
+    editRadius = ck.dbh != null ? Number(ck.dbh) / 2 : null;
+    editCenter = new THREE.Vector3(ck.exactX, ck.exactY, ck.exactZ);
+  }
+  if (editCenter) {
+    // Default radius when adding: proportional to camera distance (same as placeDbhCircle)
+    if (!editRadius || editRadius <= 0) {
+      const camDist = dbhTargetRow ? dbhTargetRow.camera.position.distanceTo(dbhTargetRow.vp.pivotPoint) : 10;
+      editRadius = camDist * 0.015;
+    }
+    dbhCircleRadius = editRadius;
+    dbhCircleCenter = editCenter;
+    rebuildDbhCircle();
+    dbhConfirmPending = true;
+    updateDbhCircleDisplay();
+    const isEdit = (_editingDbhAnnIdx >= 0
+      ? (annotationPositions[_editingDbhAnnIdx]._dbh != null || annotationPositions[_editingDbhAnnIdx].dbh != null)
+      : (_editingDbhClickIdx >= 0 && clickedPoints[_editingDbhClickIdx].dbh != null));
+    status(isEdit
+      ? "Edit DBH — arrows to move, +/− to resize, ✔ saves."
+      : "Add DBH — arrows to move, +/− to resize, ✔ saves.");
+  } else {
+    status("Top view — dbl-click each trunk, +/− resize, Enter to lock, dbl-click next. ✔ saves all.");
+  }
 }
 
 function placeDbhCircle(pos3d) {
@@ -2229,6 +2687,19 @@ function commitActiveCircle() {
       if(dd<bestDist){bestDist=dd; annIdx=i;}
     });
   }
+  // Recolor the editing cylinder to the normal marker color now that it's committed
+  if (dbhCircleMesh) {
+    const normalColor = new THREE.Color(document.getElementById('markerColor').value || '#ff69b4');
+    dbhCircleMesh.traverse(child => {
+      if (child.material) {
+        // Skip the dark halo — keep it black for contrast
+        if (child.material.color && child.material.color.getHex() !== 0x000000) {
+          child.material.color.copy(normalColor);
+        }
+        if (child.material instanceof THREE.MeshBasicMaterial) child.material.opacity = 0.35;
+      }
+    });
+  }
   // Store in placed array (mesh stays in scene)
   dbhPlacedCircles.push({
     mesh: dbhCircleMesh,
@@ -2243,65 +2714,80 @@ function commitActiveCircle() {
   dbhConfirmPending = false;
 }
 
+// Editing-cylinder color — bright yellow so it's clearly distinct from committed cylinders
+const DBH_EDIT_COLOR = new THREE.Color(0xffdd00);
+
 function rebuildDbhCircle() {
-  if(dbhCircleMesh&&dbhCircleMesh.parent)dbhCircleMesh.parent.remove(dbhCircleMesh);
-  const canvas = document.createElement('canvas');
-  canvas.width = 256; canvas.height = 256;
-  const ctx = canvas.getContext('2d');
-  ctx.clearRect(0,0,256,256);
-  // Outer glow for visibility
-  ctx.strokeStyle = 'rgba(0,0,0,0.4)';
-  ctx.lineWidth = 20;
-  ctx.beginPath();
-  ctx.arc(128, 128, 100, 0, Math.PI*2);
-  ctx.stroke();
-  // Main bold black circle
-  ctx.strokeStyle = '#000000';
-  ctx.lineWidth = 12;
-  ctx.beginPath();
-  ctx.arc(128, 128, 100, 0, Math.PI*2);
-  ctx.stroke();
-  // Inner white outline for contrast
-  ctx.strokeStyle = 'rgba(255,255,255,0.5)';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.arc(128, 128, 100, 0, Math.PI*2);
-  ctx.stroke();
-  // Crosshair
-  ctx.strokeStyle = '#000000';
-  ctx.lineWidth = 5;
-  ctx.beginPath(); ctx.moveTo(98,128); ctx.lineTo(158,128); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(128,98); ctx.lineTo(128,158); ctx.stroke();
-  // Center dot
-  ctx.fillStyle = '#000000';
-  ctx.beginPath(); ctx.arc(128, 128, 5, 0, Math.PI*2); ctx.fill();
-  const texture = new THREE.CanvasTexture(canvas);
-  const mat = new THREE.SpriteMaterial({map:texture, transparent:true, depthTest:false});
-  dbhCircleMesh = new THREE.Sprite(mat);
-  dbhCircleMesh.position.copy(dbhCircleCenter);
-  const size = dbhCircleRadius * 2;
-  dbhCircleMesh.scale.set(size, size, 1);
-  if(dbhTargetRow)dbhTargetRow.scene.add(dbhCircleMesh);
+  // Remove previous editing cylinder if any
+  if (dbhCircleMesh && dbhCircleMesh.parent) dbhCircleMesh.parent.remove(dbhCircleMesh);
+  dbhCircleMesh = null;
+  if (!dbhCircleCenter || !dbhTargetRow) return;
+
+  const radius = dbhCircleRadius;
+  const height = 1.0;
+  const segs = 48;
+
+  // Filled semi-transparent cylinder (open-ended, same as buildDbhCylinders)
+  const fillGeo = new THREE.CylinderGeometry(radius, radius, height, segs, 1, true);
+  const fillMat = new THREE.MeshBasicMaterial({
+    color: DBH_EDIT_COLOR,
+    transparent: true, opacity: 0.45,
+    side: THREE.DoubleSide, depthWrite: false
+  });
+  const fillMesh = new THREE.Mesh(fillGeo, fillMat);
+  fillMesh.rotation.x = Math.PI / 2;
+  fillMesh.renderOrder = 4;
+
+  // Bold edge ring (two concentric rings for emphasis)
+  const ringGeo = new THREE.EdgesGeometry(
+    new THREE.CylinderGeometry(radius, radius, height, segs, 1, true)
+  );
+  const ringMat = new THREE.LineBasicMaterial({
+    color: DBH_EDIT_COLOR, transparent: true, opacity: 1.0, linewidth: 2
+  });
+  const ring = new THREE.LineSegments(ringGeo, ringMat);
+  ring.rotation.x = Math.PI / 2;
+  ring.renderOrder = 5;
+
+  // Thin outer halo ring (slightly larger radius) for contrast
+  const haloGeo = new THREE.EdgesGeometry(
+    new THREE.CylinderGeometry(radius + 0.01, radius + 0.01, height, segs, 1, true)
+  );
+  const haloMat = new THREE.LineBasicMaterial({
+    color: new THREE.Color(0x000000), transparent: true, opacity: 0.5
+  });
+  const halo = new THREE.LineSegments(haloGeo, haloMat);
+  halo.rotation.x = Math.PI / 2;
+  halo.renderOrder = 4;
+
+  // Group all parts so position changes are applied together
+  const group = new THREE.Group();
+  group.add(fillMesh, ring, halo);
+  group.position.copy(dbhCircleCenter);
+  group.userData.isDbhEditCylinder = true;
+
+  dbhTargetRow.scene.add(group);
+  dbhCircleMesh = group;
 }
 
-function moveDbhCircle(dx,dy){
-  if(!dbhCircleCenter||!dbhConfirmPending)return;
-  // Move proportional to camera distance so it's visible per keystroke
+function moveDbhCircle(dx, dy) {
+  if (!dbhCircleCenter || !dbhConfirmPending) return;
+  // Move proportional to camera distance so each keystroke is visible
   const camDist = dbhTargetRow ? dbhTargetRow.camera.position.distanceTo(dbhTargetRow.vp.pivotPoint) : 10;
   const step = camDist * 0.005;
   dbhCircleCenter.x += dx * step;
   dbhCircleCenter.y += dy * step;
-  if(dbhCircleMesh)dbhCircleMesh.position.copy(dbhCircleCenter);
+  if (dbhCircleMesh) dbhCircleMesh.position.copy(dbhCircleCenter);
 }
 
-function resizeDbhCircle(delta){
-  if(!dbhConfirmPending||!dbhCircleMesh)return;
+function resizeDbhCircle(delta) {
+  if (!dbhConfirmPending || !dbhCircleMesh) return;
   // Scale delta proportional to camera distance
   const camDist = dbhTargetRow ? dbhTargetRow.camera.position.distanceTo(dbhTargetRow.vp.pivotPoint) : 10;
   const scaledDelta = delta * camDist * 0.002;
-  dbhCircleRadius=Math.max(0.005, dbhCircleRadius + scaledDelta);
-  const size = dbhCircleRadius * 2;
-  dbhCircleMesh.scale.set(size, size, 1);
+  dbhCircleRadius = Math.max(0.005, dbhCircleRadius + scaledDelta);
+  // Rebuild geometry with new radius (can't scale a cylinder in place)
+  rebuildDbhCircle();
   updateDbhCircleDisplay();
 }
 
@@ -2310,10 +2796,11 @@ function confirmDbhCircle(){
   if(dbhConfirmPending && dbhCircleMesh && dbhCircleCenter) {
     commitActiveCircle();
   }
-  // Save ALL placed circles' diameters to the annotation table
   const tbody = document.getElementById("clickLogTbody");
   let savedCount = 0;
+
   dbhPlacedCircles.forEach(pc => {
+    // ─ Write to annotation if we were editing an annotation ─
     if(pc.annIdx >= 0 && annotationPositions && pc.annIdx < annotationPositions.length) {
       annotationPositions[pc.annIdx]._dbh = pc.diameter;
       tbody.querySelectorAll("tr.ann-row").forEach(tr => {
@@ -2326,8 +2813,27 @@ function confirmDbhCircle(){
       status(`DBH: ${pc.diameter}m → instance ${annotationPositions[pc.annIdx].instance}`);
     }
   });
-  if(savedCount > 0) status(`Saved ${savedCount} DBH measurement(s)`);
-  else if(dbhPlacedCircles.length > 0) status(`${dbhPlacedCircles.length} circle(s) placed but no annotation match`);
+
+  // ─ Write to click marker if we were editing a click ─
+  if (_editingDbhClickIdx >= 0 && _editingDbhClickIdx < clickedPoints.length) {
+    const click = clickedPoints[_editingDbhClickIdx];
+    // Use the last placed circle
+    const pc = dbhPlacedCircles[dbhPlacedCircles.length - 1];
+    if (pc) {
+      click.dbh = pc.diameter;
+      tbody.querySelectorAll("tr.click-row").forEach(tr => {
+        if (parseInt(tr.dataset.clickId) === click.id) {
+          const c = tr.querySelector(".dbh-cell");
+          if (c) c.textContent = pc.diameter;
+        }
+      });
+      savedCount++;
+      status(`DBH: ${pc.diameter}m → click #${click.id}`);
+    }
+  }
+
+  if(savedCount === 0 && dbhPlacedCircles.length > 0)
+    status(`${dbhPlacedCircles.length} circle(s) placed but no annotation match`);
 }
 
 function updateDbhCircleDisplay(){
@@ -2336,29 +2842,8 @@ function updateDbhCircleDisplay(){
 
 function setupDbh() {
   document.getElementById("menuDbhCalc").addEventListener("click", openDbhCalc);
-  document.getElementById("btnShowBlackPlane").addEventListener("click", ()=>{
-    dbhLinesVisible=!dbhLinesVisible;
-    if(dbhLinesVisible && activeIsolatedId!==null) buildDbhPlanes();
-    else { clearDbhMeshes(); dbhLinesVisible=false; }
-    document.getElementById("btnShowBlackPlane").textContent = dbhLinesVisible ? "📏 Hide 1.5m Plane" : "📏 Show 1.5m Reference Plane";
-  });
   document.getElementById("btnDbhClose").addEventListener("click", closeSliceTool);
   document.getElementById("btnDbhSave").addEventListener("click", ()=>{confirmDbhCircle();saveAndReturnToCluster();});
-  document.getElementById("dbhHeightSlider").addEventListener("input", e=>{
-    dbhSliceOffset=parseFloat(e.target.value);
-    document.getElementById("dbhHeightVal").textContent=dbhSliceOffset.toFixed(2)+" m";
-    updateDbhRedPlane();
-    // If already in top-view sliced mode, re-slice immediately at new height
-    if (dbhTopViewMode && dbhSliceActive && dbhHiddenPoints && dbhTargetRow) {
-      // Restore original pre-slice colors before re-slicing
-      const c = dbhTargetRow.points.geometry.attributes.color;
-      c.array.set(dbhHiddenPoints);
-      c.needsUpdate = true;
-      dbhHiddenPoints = null;
-      doDbhSlice();
-    }
-  });
-  document.getElementById("btnDoSlice").addEventListener("click", doDbhSlice);
   document.getElementById("btnCircleShrink").addEventListener("click", ()=>resizeDbhCircle(-1));
   document.getElementById("btnCircleGrow").addEventListener("click", ()=>resizeDbhCircle(1));
   document.addEventListener("keydown", e=>{
@@ -2382,10 +2867,7 @@ function openDbhCalc() {
   dbhSavedClusterId = activeIsolatedId;
   dbhSliceActive=true; dbhSliceOffset=1.5; dbhTopViewMode=false; dbhConfirmPending=false;
   document.getElementById("dbhPanel").style.display="block";
-  document.getElementById("dbhHeightSlider").value="1.5";
-  document.getElementById("dbhHeightVal").textContent="1.5 m";
   document.getElementById("dbhCircleTools").style.display="none";
-  document.getElementById("btnShowBlackPlane").textContent="📏 Show 1.5m Reference Plane";
   dbhLinesVisible=false;
   if(!dbhGroundGrids[activeIsolatedId]){
     linRows.forEach(r=>{
@@ -2431,6 +2913,11 @@ function saveAndReturnToCluster() {
     const fileVis = annotationFileVisibility[ann.file] !== false;
     annotationMarkers[_editingDbhAnnIdx].visible = annotationVisible && fileVis;
   }
+  // Restore the edited click marker
+  if (_editingDbhClickIdx >= 0 && _editingDbhClickIdx < clickMarkers.length) {
+    const marker = clickMarkers[_editingDbhClickIdx];
+    if (marker) marker.visible = true;
+  }
 
   // Return to the cluster view we were working on (not clearIsolation)
   if(dbhSavedClusterId !== null) {
@@ -2440,6 +2927,7 @@ function saveAndReturnToCluster() {
 
   // Update highlighted row with new DBH and flash green
   const savedEditIdx = _editingDbhAnnIdx;
+  const savedClickIdx = _editingDbhClickIdx;
   if (savedEditIdx >= 0 && annotationPositions) {
     const newDbh = annotationPositions[savedEditIdx]._dbh;
     if (newDbh) {
@@ -2455,13 +2943,31 @@ function saveAndReturnToCluster() {
       });
     }
   }
+  if (savedClickIdx >= 0 && savedClickIdx < clickedPoints.length) {
+    const click = clickedPoints[savedClickIdx];
+    if (click.dbh) {
+      const tbody = document.getElementById("clickLogTbody");
+      tbody.querySelectorAll("tr.click-row").forEach(tr => {
+        if (parseInt(tr.dataset.clickId) === click.id) {
+          const c = tr.querySelector(".dbh-cell");
+          if (c) c.textContent = click.dbh;
+          tr.style.background = "rgba(0,200,80,.4)";
+          tr.style.outline = "1px solid #0c8";
+          setTimeout(() => { tr.style.background = ""; tr.style.outline = ""; }, 1500);
+        }
+      });
+    }
+  }
   clearEditHighlight();
   _editingDbhAnnIdx = -1;
+  _editingDbhClickIdx = -1;
   _editingDbhOldValue = null;
 
   // Rebuild cylinders with new DBH values — always rebuild to pick up updated DBH
   buildDbhCylinders();
   if (activeIsolatedId !== null) filterCylindersByCluster(activeIsolatedId);
+  // Persist click DBH to server
+  if (savedClickIdx >= 0) autoSaveClicks();
 }
 
 function onDbhDoubleClick(ri,e){
@@ -3170,7 +3676,7 @@ function clearScene() {
   dbhPlacedCircles=[];
   dbhHiddenPoints = null; dbhSavedCams = {};
   dbhLinesVisible = false; dbhGroundGrids = {};
-  _editingDbhAnnIdx = -1; _editingDbhOldValue = null;
+  _editingDbhAnnIdx = -1; _editingDbhClickIdx = -1; _editingDbhOldValue = null;
   _pendingAnnReplace = -1;
   dbhCylindersVisible = false;
   const cylBtn = document.getElementById("tbCylinders");
