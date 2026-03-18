@@ -38,6 +38,7 @@ pointcloud-viewer/
 git clone https://github.com/your-username/pointcloud-viewer.git
 cd pointcloud-viewer
 python3 -m venv venv
+#python -m venv venv            # if upper one doesn't work
 source venv/bin/activate        # Linux/macOS
 # venv\Scripts\activate         # Windows
 pip install -r requirements.txt
