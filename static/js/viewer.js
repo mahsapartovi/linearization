@@ -96,7 +96,7 @@ let dbhCylindersVisible = false; // toolbar toggle state
 let linInstanceLabels = null;
 let _pendingAnnReplace = -1; // annotation index waiting for replacement position
 
-// Undo stack for annotation operations
+// Undo stack for ALL operations (annotations + click markers)
 let _undoStack = [];
 const MAX_UNDO = 50;
 
@@ -550,7 +550,7 @@ function clearPointHoverRing() {
 function _hoverRingRadius(camera, vp) {
   // Scale ring so it appears as a fixed screen-space circle regardless of zoom
   const dist = camera.position.distanceTo(vp.pivotPoint);
-  return Math.max(0.02, dist * 0.018);
+  return Math.max(0.008, dist * 0.008);
 }
 
 function updatePointHoverRing(e) {
@@ -738,12 +738,16 @@ function onMainDoubleClick(event) {
       const idx=clickMarkers.indexOf(hit);
       if(idx!==-1){
         const removedClick = clickedPoints[idx];
+        const markerPos = hit.position.clone();
+        const markerScene = hit.parent || scene;
+        // Push undo BEFORE removing
+        if (removedClick) _pushClickRemoveUndo(removedClick, markerPos, markerScene);
         scene.remove(hit); clickMarkers.splice(idx,1);
         clickedPoints.splice(idx,1);
         updateClickCount();
         autoSaveClicks();
         if (removedClick) removeClickLogEntry(removedClick.id);
-        status(`Removed marker. ${clickedPoints.length} clicks remaining.`);
+        status(`Removed marker. ${clickedPoints.length} clicks remaining. Ctrl+Z to undo.`);
         return;
       }
     }
@@ -818,6 +822,8 @@ function onMainDoubleClick(event) {
     clickedPoints.push(clickData);
     const marker=createClickMarker(new THREE.Vector3(ex,ey,ez), clickData.markerColor, clickData.markerSize);
     clickMarkers.push(marker); scene.add(marker);
+    // Push undo for the addition
+    _pushClickAddUndo(clickedPoints.length - 1);
     updateClickCount();
     autoSaveClicks();
     addClickLogEntry(clickData);
@@ -869,7 +875,8 @@ function onRowDoubleClick(event, ri) {
           } else {
             // Push undo before modifying (preserves DBH + position)
             _pushAnnUndo(annIdx);
-            // Hide marker + cylinder
+            // Mark as deleted + hide marker + cylinder
+            annotationPositions[annIdx]._deleted = true;
             hitMarker.visible = false;
             dbhCylinders.forEach(c => { if (c.userData.annIdx === annIdx) c.visible = false; });
             // Grey out table row
@@ -880,8 +887,9 @@ function onRowDoubleClick(event, ri) {
                 tr.style.textDecoration = "line-through";
               }
             });
-            _pendingAnnReplace = annIdx;
-            status(`Annotation A${annIdx+1} removed — double-click a new position to replace it. Ctrl+Z to undo.`);
+            // Do NOT enter replace mode — annotation is deleted. Ctrl+Z to undo.
+            _pendingAnnReplace = -1;
+            status(`Annotation A${annIdx+1} removed — Ctrl+Z to undo.`);
             return;
           }
         }
@@ -967,11 +975,15 @@ function onRowDoubleClick(event, ri) {
       const idx = clickMarkers.indexOf(hit);
       if (idx !== -1) {
         const removedClick = clickedPoints[idx];
+        const markerPos = hit.position.clone();
+        const markerScene = hit.parent || ri.row.scene;
+        // Push undo BEFORE removing
+        if (removedClick) _pushClickRemoveUndo(removedClick, markerPos, markerScene);
         ri.row.scene.remove(hit); clickMarkers.splice(idx, 1);
         clickedPoints.splice(idx, 1);
         updateClickCount(); autoSaveClicks();
         if (removedClick) removeClickLogEntry(removedClick.id);
-        status(`Removed marker. ${clickedPoints.length} clicks remaining.`);
+        status(`Removed marker. ${clickedPoints.length} clicks remaining. Ctrl+Z to undo.`);
         return;
       }
     }
@@ -1028,6 +1040,8 @@ function onRowDoubleClick(event, ri) {
     clickedPoints.push(clickData);
     const marker = createClickMarker(new THREE.Vector3(ex, ey, ez), clickData.markerColor, clickData.markerSize);
     clickMarkers.push(marker); ri.row.scene.add(marker);
+    // Push undo for the addition
+    _pushClickAddUndo(clickedPoints.length - 1);
     updateClickCount(); autoSaveClicks();
     addClickLogEntry(clickData);
     const origStr = origX !== '' ? ` | Orig(${Number(origX).toFixed(3)}, ${Number(origY).toFixed(3)}, ${Number(origZ).toFixed(3)})` : '';
@@ -1267,6 +1281,21 @@ function findNearestInMesh(ox, oy, oz, clusterId) {
 // CSV EXPORT
 // ═══════════════════════════════════════════════════════════
 
+// Format a timestamp (ms since epoch) to human-readable local time
+function _formatTimestamp(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  const pad = (n, w) => String(n).padStart(w || 2, '0');
+  const yyyy = d.getFullYear(), mm = pad(d.getMonth()+1), dd = pad(d.getDate());
+  const hh = pad(d.getHours()), mi = pad(d.getMinutes()), ss = pad(d.getSeconds());
+  // Timezone offset like +05:30 or -04:00
+  const tzOff = -d.getTimezoneOffset();
+  const tzSign = tzOff >= 0 ? '+' : '-';
+  const tzH = pad(Math.floor(Math.abs(tzOff)/60));
+  const tzM = pad(Math.abs(tzOff)%60);
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss} UTC${tzSign}${tzH}:${tzM}`;
+}
+
 function exportClicksCSV() {
   if(!clickedPoints.length){ alert("No clicked points to export."); return; }
   const headers=['ID','ViewX','ViewY','ViewZ','OriginalX','OriginalY','OriginalZ',
@@ -1275,41 +1304,89 @@ function exportClicksCSV() {
   const rows=[headers.join(',')];
   clickedPoints.forEach(c=>{
     rows.push([c.id,c.x,c.y,c.z,c.originalX,c.originalY,c.originalZ,
-      c.pointIndex,c.intersectionDistance,c.timestamp,`"${c.cloudName||''}"`,c.clusterId,`"${c.viewType||''}"`,
+      c.pointIndex,c.intersectionDistance,`"${_formatTimestamp(c.timestamp)}"`,`"${c.cloudName||''}"`,c.clusterId,`"${c.viewType||''}"`,
       c.pointSize,`"${c.markerColor||'#ff0000'}"`,c.markerSize||1.0,
       c.cameraX,c.cameraY,c.cameraZ,c.cameraRotX,c.cameraRotY,c.cameraRotZ,c.cameraFov,c.cameraDistance].join(','));
   });
   const blob=new Blob([rows.join('\n')],{type:'text/csv;charset=utf-8;'});
   const url=URL.createObjectURL(blob), link=document.createElement('a');
-  link.href=url; link.download=`clicked_points_${Date.now()}.csv`;
+  const ts = _formatTimestamp(Date.now()).replace(/[: ]/g, '_').replace(/[+]/g, 'p').replace(/UTC/g, '');
+  link.href=url; link.download=`clicked_points_${ts}.csv`;
   document.body.appendChild(link); link.click(); document.body.removeChild(link);
   URL.revokeObjectURL(url);
   status(`Exported ${clickedPoints.length} clicks to CSV (with original XYZ).`);
 }
 
 function exportAnnotationsCSV() {
-  if (!annotationPositions || !annotationPositions.length) {
-    alert("No annotation data to export. Upload annotation PLY/CSV files first.");
+  // Build a unified list from annotations + user click markers, reflecting the current state.
+  // Deleted annotations (hidden markers) are marked as "Deleted".
+  // User-added click markers are included as new entries.
+  const allRows = [];
+
+  // ── 1. Original annotations (from uploaded files) ──
+  if (annotationPositions && annotationPositions.length > 0) {
+    annotationPositions.forEach((ann, i) => {
+      const isDeleted = ann._deleted === true;
+      const treeId = ann.instance !== undefined ? ann.instance : '';
+      const x = Number(ann.orig_x).toFixed(4);
+      const y = Number(ann.orig_y).toFixed(4);
+      const z = Number(ann.orig_z).toFixed(4);
+      const cluster = ann.cluster !== undefined && ann.cluster >= 0 ? ann.cluster : '';
+      const dbh = ann._dbh || (ann.dbh != null ? Number(ann.dbh).toFixed(4) : '');
+      const source = ann.file || 'Annotation';
+      const status = isDeleted ? 'Deleted' : 'Original';
+      allRows.push({ treeId, x, y, z, cluster, dbh, source, status,
+        timestamp: '' });
+    });
+  }
+
+  // ── 2. User-added click markers ──
+  if (clickedPoints && clickedPoints.length > 0) {
+    clickedPoints.forEach(ck => {
+      const ox = ck.originalX !== '' && ck.originalX !== undefined ? Number(ck.originalX).toFixed(4) : '';
+      const oy = ck.originalY !== '' && ck.originalY !== undefined ? Number(ck.originalY).toFixed(4) : '';
+      const oz = ck.originalZ !== '' && ck.originalZ !== undefined ? Number(ck.originalZ).toFixed(4) : '';
+      const cluster = ck.clusterId !== undefined && ck.clusterId >= 0 ? ck.clusterId : '';
+      const dbh = ck.dbh != null ? ck.dbh : '';
+      allRows.push({
+        treeId: `Click_${ck.id}`,
+        x: ox || Number(ck.exactX).toFixed(4),
+        y: oy || Number(ck.exactY).toFixed(4),
+        z: oz || Number(ck.exactZ).toFixed(4),
+        cluster: cluster,
+        dbh: dbh,
+        source: 'UserClick',
+        status: 'Added',
+        timestamp: _formatTimestamp(ck.timestamp),
+      });
+    });
+  }
+
+  if (allRows.length === 0) {
+    alert("No annotation or click data to export.");
     return;
   }
-  const headers = ['TreeID', 'X', 'Y', 'Z', 'Cluster', 'DBH'];
-  const rows = [headers.join(',')];
-  annotationPositions.forEach(ann => {
-    const treeId = ann.instance !== undefined ? ann.instance : '—';
-    const x = Number(ann.orig_x).toFixed(4);
-    const y = Number(ann.orig_y).toFixed(4);
-    const z = Number(ann.orig_z).toFixed(4);
-    const cluster = ann.cluster !== undefined && ann.cluster >= 0 ? ann.cluster : '';
-    const dbh = ann._dbh || (ann.dbh != null ? Number(ann.dbh).toFixed(4) : '');
-    rows.push([treeId, x, y, z, cluster, dbh].join(','));
+
+  const headers = ['TreeID', 'X', 'Y', 'Z', 'Cluster', 'DBH', 'Source', 'Status', 'Timestamp'];
+  const csvRows = [headers.join(',')];
+  allRows.forEach(r => {
+    csvRows.push([
+      r.treeId, r.x, r.y, r.z, r.cluster, r.dbh,
+      `"${r.source}"`, r.status, `"${r.timestamp}"`
+    ].join(','));
   });
-  const blob = new Blob([rows.join('\n')], {type: 'text/csv;charset=utf-8;'});
+
+  const blob = new Blob([csvRows.join('\n')], {type: 'text/csv;charset=utf-8;'});
   const url = URL.createObjectURL(blob), link = document.createElement('a');
   const name = cloudData ? cloudData.name.replace(/\.[^.]+$/, '') : 'annotations';
-  link.href = url; link.download = `${name}_annotations.csv`;
+  const ts = _formatTimestamp(Date.now()).replace(/[: ]/g, '_').replace(/[+]/g, 'p').replace(/UTC/g, '');
+  link.href = url; link.download = `${name}_annotations_${ts}.csv`;
   document.body.appendChild(link); link.click(); document.body.removeChild(link);
   URL.revokeObjectURL(url);
-  status(`Exported ${annotationPositions.length} annotations to CSV.`);
+  const origCount = annotationPositions ? annotationPositions.length : 0;
+  const clickCount = clickedPoints ? clickedPoints.length : 0;
+  const deletedCount = allRows.filter(r => r.status === 'Deleted').length;
+  status(`Exported ${allRows.length} entries (${origCount} annotations, ${clickCount} clicks, ${deletedCount} deleted).`);
 }
 
 function setupClickExport() {
@@ -3922,6 +3999,7 @@ function _pushAnnUndo(annIdx) {
   const ann = annotationPositions[annIdx];
   const marker = (annIdx < annotationMarkers.length) ? annotationMarkers[annIdx] : null;
   _undoStack.push({
+    type: 'ann_delete',  // annotation was deleted/hidden
     annIdx: annIdx,
     x: ann.x, y: ann.y, z: ann.z,
     orig_x: ann.orig_x, orig_y: ann.orig_y, orig_z: ann.orig_z,
@@ -3929,158 +4007,303 @@ function _pushAnnUndo(annIdx) {
     markerX: marker ? marker.position.x : 0,
     markerY: marker ? marker.position.y : 0,
     markerZ: marker ? marker.position.z : 0,
-    wasPendingReplace: false, // set true by delete actions
+    wasPendingReplace: false,
   });
   if (_undoStack.length > MAX_UNDO) _undoStack.shift();
 }
 
-// Ctrl+Z handler — undo last annotation operation
+// Push undo entry for a click marker addition
+function _pushClickAddUndo(clickIdx) {
+  _undoStack.push({
+    type: 'click_add',
+    clickIdx: clickIdx,
+    clickData: { ...clickedPoints[clickIdx] },
+  });
+  if (_undoStack.length > MAX_UNDO) _undoStack.shift();
+}
+
+// Push undo entry for a click marker removal
+function _pushClickRemoveUndo(clickData, markerPos, markerScene) {
+  _undoStack.push({
+    type: 'click_remove',
+    clickData: { ...clickData },
+    markerX: markerPos.x, markerY: markerPos.y, markerZ: markerPos.z,
+    markerScene: markerScene, // reference to scene for re-adding
+  });
+  if (_undoStack.length > MAX_UNDO) _undoStack.shift();
+}
+
+// Ctrl+Z handler — undo last operation (any type)
 function _undoLastAnnAction() {
   if (_undoStack.length === 0) { status("Nothing to undo."); return; }
   const u = _undoStack.pop();
-  if (!annotationPositions || u.annIdx >= annotationPositions.length) return;
-  const ann = annotationPositions[u.annIdx];
 
-  // Restore annotation position fields (DBH is never touched)
-  ann.x = u.x; ann.y = u.y; ann.z = u.z;
-  ann.orig_x = u.orig_x; ann.orig_y = u.orig_y; ann.orig_z = u.orig_z;
-  ann.cluster = u.cluster;
+  // ── Undo annotation delete ──
+  if (u.type === 'ann_delete') {
+    if (!annotationPositions || u.annIdx >= annotationPositions.length) return;
+    const ann = annotationPositions[u.annIdx];
 
-  // Cancel any pending replacement for this annotation
-  if (_pendingAnnReplace === u.annIdx) _pendingAnnReplace = -1;
+    // Restore annotation position fields (DBH is never touched)
+    ann.x = u.x; ann.y = u.y; ann.z = u.z;
+    ann.orig_x = u.orig_x; ann.orig_y = u.orig_y; ann.orig_z = u.orig_z;
+    ann.cluster = u.cluster;
+    ann._deleted = false;
 
-  // Restore 3D marker position and visibility
-  if (u.annIdx < annotationMarkers.length && annotationMarkers[u.annIdx]) {
-    const marker = annotationMarkers[u.annIdx];
-    marker.position.set(u.markerX, u.markerY, u.markerZ);
-    const fileVis = annotationFileVisibility[ann.file] !== false;
-    const clusterOk = activeIsolatedId === null || ann.cluster === activeIsolatedId;
-    marker.visible = annotationVisible && fileVis && clusterOk;
-  }
+    // Cancel any pending replacement for this annotation
+    if (_pendingAnnReplace === u.annIdx) _pendingAnnReplace = -1;
 
-  // Restore cylinder visibility
-  dbhCylinders.forEach(c => {
-    if (c.userData.annIdx === u.annIdx) {
-      c.visible = _cylShouldBeVisible(c.userData.annIdx, c.userData.clickIdx);
+    // Restore 3D marker position and visibility
+    if (u.annIdx < annotationMarkers.length && annotationMarkers[u.annIdx]) {
+      const marker = annotationMarkers[u.annIdx];
+      marker.position.set(u.markerX, u.markerY, u.markerZ);
+      const fileVis = annotationFileVisibility[ann.file] !== false;
+      const clusterOk = activeIsolatedId === null || ann.cluster === activeIsolatedId;
+      marker.visible = annotationVisible && fileVis && clusterOk;
     }
-  });
 
-  // Restore table row (un-grey and update coords)
-  const tbody = document.getElementById("clickLogTbody");
-  if (tbody) {
-    tbody.querySelectorAll("tr.ann-row").forEach(tr => {
-      if (parseInt(tr.dataset.annIdx) === u.annIdx) {
-        tr.style.opacity = "";
-        tr.style.textDecoration = "";
-        const cells = tr.querySelectorAll("td");
-        if (cells.length >= 4) {
-          cells[1].textContent = Number(ann.orig_x).toFixed(3);
-          cells[2].textContent = Number(ann.orig_y).toFixed(3);
-          cells[3].textContent = Number(ann.orig_z).toFixed(3);
-        }
-        const clCell = tr.querySelector("[data-field='cluster']");
-        if (clCell) clCell.textContent = ann.cluster >= 0 ? ann.cluster : '—';
-        tr.dataset.cluster = ann.cluster;
-        // Flash blue to indicate undo
-        tr.style.background = "rgba(0,120,212,.35)";
-        tr.style.outline = "1px solid var(--acc)";
-        setTimeout(() => { tr.style.background = ""; tr.style.outline = ""; }, 1200);
+    // Restore cylinder visibility
+    dbhCylinders.forEach(c => {
+      if (c.userData.annIdx === u.annIdx) {
+        c.visible = _cylShouldBeVisible(c.userData.annIdx, c.userData.clickIdx);
       }
     });
+
+    // Restore table row (un-grey and update coords)
+    const tbody = document.getElementById("clickLogTbody");
+    if (tbody) {
+      tbody.querySelectorAll("tr.ann-row").forEach(tr => {
+        if (parseInt(tr.dataset.annIdx) === u.annIdx) {
+          tr.style.opacity = "";
+          tr.style.textDecoration = "";
+          const cells = tr.querySelectorAll("td");
+          if (cells.length >= 4) {
+            cells[1].textContent = Number(ann.orig_x).toFixed(3);
+            cells[2].textContent = Number(ann.orig_y).toFixed(3);
+            cells[3].textContent = Number(ann.orig_z).toFixed(3);
+          }
+          const clCell = tr.querySelector("[data-field='cluster']");
+          if (clCell) clCell.textContent = ann.cluster >= 0 ? ann.cluster : '—';
+          tr.dataset.cluster = ann.cluster;
+          // Flash blue to indicate undo
+          tr.style.background = "rgba(0,120,212,.35)";
+          tr.style.outline = "1px solid var(--acc)";
+          setTimeout(() => { tr.style.background = ""; tr.style.outline = ""; }, 1200);
+        }
+      });
+    }
+
+    status(`Undo: annotation A${u.annIdx+1} restored to (${Number(ann.orig_x).toFixed(3)}, ${Number(ann.orig_y).toFixed(3)}, ${Number(ann.orig_z).toFixed(3)})`);
+    return;
   }
 
-  status(`Undo: annotation A${u.annIdx+1} restored to (${Number(ann.orig_x).toFixed(3)}, ${Number(ann.orig_y).toFixed(3)}, ${Number(ann.orig_z).toFixed(3)})`);
+  // ── Undo click marker addition (remove the marker that was just added) ──
+  if (u.type === 'click_add') {
+    // Find and remove the click marker by matching id
+    const clickId = u.clickData.id;
+    const idx = clickedPoints.findIndex(c => c.id === clickId);
+    if (idx !== -1) {
+      const marker = clickMarkers[idx];
+      if (marker && marker.parent) marker.parent.remove(marker);
+      clickMarkers.splice(idx, 1);
+      clickedPoints.splice(idx, 1);
+      updateClickCount();
+      autoSaveClicks();
+      removeClickLogEntry(clickId);
+      status(`Undo: click marker #${clickId} removed.`);
+    } else {
+      status("Undo: click marker not found.");
+    }
+    return;
+  }
+
+  // ── Undo click marker removal (re-add the removed marker) ──
+  if (u.type === 'click_remove') {
+    const cd = u.clickData;
+    clickedPoints.push(cd);
+    const markerPos = new THREE.Vector3(u.markerX, u.markerY, u.markerZ);
+    const marker = createClickMarker(markerPos, cd.markerColor, cd.markerSize);
+    clickMarkers.push(marker);
+    // Add to the correct scene
+    const targetScene = u.markerScene || scene;
+    targetScene.add(marker);
+    updateClickCount();
+    autoSaveClicks();
+    addClickLogEntry(cd);
+    status(`Undo: click marker #${cd.id} restored.`);
+    return;
+  }
+
+  status("Nothing to undo.");
 }
 
-// D key handler — delete annotation nearest to mouse cursor, keeping DBH
+// D key handler — delete nearest annotation OR click marker under mouse cursor
 function _deleteAnnotationUnderCursor() {
-  if (!annotationPositions || !annotationPositions.length) return;
   if (_pendingAnnReplace >= 0) { status("Already in replacement mode — double-click to reposition, or Ctrl+Z to undo."); return; }
-  if (dbhTopViewMode && dbhSliceActive) return; // don't interfere with DBH editing
+  if (dbhTopViewMode && dbhSliceActive) return;
+  if (!_lastHoverEvent) { status("Move mouse over a marker and press D."); return; }
 
-  // Use the hovered annotation index from the mousemove tracker
-  let annIdx = _hoveredAnnIdx;
+  const ev = _lastHoverEvent;
 
-  // If no hovered annotation, try raycasting from last hover event
-  if (annIdx < 0 && _lastHoverEvent && isRowMode && linRows.length > 0) {
-    const ev = _lastHoverEvent;
-    const ri = getRowAtMouse(ev.clientX, ev.clientY);
-    if (ri) {
-      const rect = renderer.domElement.getBoundingClientRect();
-      const mx = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
-      const my = -((ri.localY) / ri.rowH) * 2 + 1;
+  // ── Strategy: project ALL visible markers (annotations + clicks) to screen
+  // and find the nearest one within a pixel radius.  This is far more reliable
+  // than raycasting against the point cloud and hoping to land near an annotation.
 
-      // Try hitting annotation sprites directly first
-      const visAnn = annotationMarkers.filter(m => m.parent === ri.row.scene && m.visible);
-      if (visAnn.length > 0) {
-        const rcAnn = new THREE.Raycaster();
-        rcAnn.setFromCamera(new THREE.Vector2(mx, my), ri.row.camera);
-        const annHits = rcAnn.intersectObjects(visAnn);
-        if (annHits.length > 0) {
-          const hitIdx = annotationMarkers.indexOf(annHits[0].object);
-          if (hitIdx >= 0) annIdx = hitIdx;
-        }
-      }
+  let bestAnnIdx = -1;
+  let bestClickIdx = -1;
+  let bestScreenDist = Infinity;
+  const MAX_PX = 40;  // 40-pixel grab radius on screen
 
-      // Fallback: find nearest annotation by point proximity
-      if (annIdx < 0) {
-        const rc = new THREE.Raycaster();
-        rc.setFromCamera(new THREE.Vector2(mx, my), ri.row.camera);
-        const dist = ri.row.camera.position.distanceTo(ri.row.vp.pivotPoint);
-        rc.params.Points.threshold = Math.max(0.01, dist * 0.01);
-        const hits = rc.intersectObject(ri.row.points);
-        if (hits.length > 0) {
-          const pi = hits[0].index;
-          if (ri.row.origXYZ && pi * 3 + 2 < ri.row.origXYZ.length) {
-            const ox = ri.row.origXYZ[pi*3], oy = ri.row.origXYZ[pi*3+1], oz = ri.row.origXYZ[pi*3+2];
-            let bestDist = 4.0;
-            for (let i = 0; i < annotationPositions.length; i++) {
-              const a = annotationPositions[i];
-              const dx = a.orig_x - ox, dy = a.orig_y - oy, dz = a.orig_z - oz;
-              const d = Math.sqrt(dx*dx + dy*dy + dz*dz);
-              if (d < bestDist) { bestDist = d; annIdx = i; }
-            }
-          }
-        }
-      }
+  // Helper: project a world-space position to screen pixels
+  function _worldToScreen(pos3d, cam, rect, rowInfo) {
+    const v = pos3d.clone().project(cam);
+    if (v.z > 1) return null;  // behind camera
+    let sx, sy;
+    if (rowInfo) {
+      sx = (v.x * 0.5 + 0.5) * rect.width + rect.left;
+      // Row mode: localY
+      sy = (-v.y * 0.5 + 0.5) * rowInfo.rowH + (rowInfo.idx * (rowInfo.rowH + ROW_GAP));
+      sy += rect.top - (document.getElementById("viewportContainer").scrollTop || 0);
+      // Actually, for screen comparison, just use the raw client coords approach
+    } else {
+      sx = (v.x * 0.5 + 0.5) * rect.width + rect.left;
+      sy = (-v.y * 0.5 + 0.5) * rect.height + rect.top;
     }
+    return { x: sx, y: sy };
   }
 
-  if (annIdx < 0 || annIdx >= annotationPositions.length) {
-    status("No annotation near cursor. Hover near a tree annotation and press D.");
-    return;
-  }
+  const mouseX = ev.clientX, mouseY = ev.clientY;
 
-  const ann = annotationPositions[annIdx];
-  // Validate cluster isolation
-  if (activeIsolatedId !== null && ann.cluster !== activeIsolatedId) {
-    status("This annotation belongs to a different cluster.");
-    return;
-  }
+  if (isRowMode && linRows.length > 0) {
+    const rect = renderer.domElement.getBoundingClientRect();
+    const container = document.getElementById("viewportContainer");
+    const scrollTop = container ? container.scrollTop : 0;
+    const rowH = effectiveRowHeight();
 
-  // Push undo (preserves position + DBH)
-  _pushAnnUndo(annIdx);
+    linRows.forEach((r, rIdx) => {
+      const rowTop = rect.top + rIdx * (rowH + ROW_GAP) - scrollTop;
+      const rowBot = rowTop + rowH;
+      // Only check rows that are near the mouse
+      if (mouseY < rowTop - MAX_PX || mouseY > rowBot + MAX_PX) return;
 
-  // Hide marker + cylinder
-  if (annIdx < annotationMarkers.length && annotationMarkers[annIdx]) {
-    annotationMarkers[annIdx].visible = false;
-  }
-  dbhCylinders.forEach(c => { if (c.userData.annIdx === annIdx) c.visible = false; });
+      const cam = r.camera;
 
-  // Grey out table row
-  const tbody = document.getElementById("clickLogTbody");
-  if (tbody) {
-    tbody.querySelectorAll("tr.ann-row").forEach(tr => {
-      if (parseInt(tr.dataset.annIdx) === annIdx) {
-        tr.style.opacity = "0.3";
-        tr.style.textDecoration = "line-through";
+      // Check annotation sprites in this row
+      annotationMarkers.forEach((m, i) => {
+        if (!m.visible || m.parent !== r.scene) return;
+        if (i >= annotationPositions.length) return;
+        const ann = annotationPositions[i];
+        if (activeIsolatedId !== null && ann.cluster !== activeIsolatedId) return;
+        const v = m.position.clone().project(cam);
+        if (v.z > 1) return;
+        const sx = (v.x * 0.5 + 0.5) * rect.width + rect.left;
+        const sy = (-v.y * 0.5 + 0.5) * rowH + rowTop;
+        const dx = sx - mouseX, dy = sy - mouseY;
+        const d = Math.sqrt(dx*dx + dy*dy);
+        if (d < MAX_PX && d < bestScreenDist) {
+          bestScreenDist = d; bestAnnIdx = i; bestClickIdx = -1;
+        }
+      });
+
+      // Check click markers in this row
+      clickMarkers.forEach((m, i) => {
+        if (!m.visible || m.parent !== r.scene) return;
+        if (i >= clickedPoints.length) return;
+        if (activeIsolatedId !== null && clickedPoints[i].clusterId !== activeIsolatedId) return;
+        const v = m.position.clone().project(cam);
+        if (v.z > 1) return;
+        const sx = (v.x * 0.5 + 0.5) * rect.width + rect.left;
+        const sy = (-v.y * 0.5 + 0.5) * rowH + rowTop;
+        const dx = sx - mouseX, dy = sy - mouseY;
+        const d = Math.sqrt(dx*dx + dy*dy);
+        if (d < MAX_PX && d < bestScreenDist) {
+          bestScreenDist = d; bestClickIdx = i; bestAnnIdx = -1;
+        }
+      });
+    });
+  } else {
+    // Single-scene / main view mode
+    const rect = renderer.domElement.getBoundingClientRect();
+    const cam = camera;
+
+    annotationMarkers.forEach((m, i) => {
+      if (!m.visible || m.parent !== scene) return;
+      if (i >= annotationPositions.length) return;
+      const ann = annotationPositions[i];
+      if (activeIsolatedId !== null && ann.cluster !== activeIsolatedId) return;
+      const v = m.position.clone().project(cam);
+      if (v.z > 1) return;
+      const sx = (v.x * 0.5 + 0.5) * rect.width + rect.left;
+      const sy = (-v.y * 0.5 + 0.5) * rect.height + rect.top;
+      const dx = sx - mouseX, dy = sy - mouseY;
+      const d = Math.sqrt(dx*dx + dy*dy);
+      if (d < MAX_PX && d < bestScreenDist) {
+        bestScreenDist = d; bestAnnIdx = i; bestClickIdx = -1;
+      }
+    });
+
+    clickMarkers.forEach((m, i) => {
+      if (!m.visible) return;
+      if (i >= clickedPoints.length) return;
+      const v = m.position.clone().project(cam);
+      if (v.z > 1) return;
+      const sx = (v.x * 0.5 + 0.5) * rect.width + rect.left;
+      const sy = (-v.y * 0.5 + 0.5) * rect.height + rect.top;
+      const dx = sx - mouseX, dy = sy - mouseY;
+      const d = Math.sqrt(dx*dx + dy*dy);
+      if (d < MAX_PX && d < bestScreenDist) {
+        bestScreenDist = d; bestClickIdx = i; bestAnnIdx = -1;
       }
     });
   }
 
-  _pendingAnnReplace = annIdx;
-  const dbhStr = (ann._dbh || ann.dbh) ? ` (DBH=${ann._dbh || ann.dbh} preserved)` : '';
-  status(`Annotation A${annIdx+1} deleted (D)${dbhStr} — double-click to reposition, Ctrl+Z to undo.`);
+  // ── Delete the nearest annotation ──
+  if (bestAnnIdx >= 0 && annotationPositions) {
+    const annIdx = bestAnnIdx;
+    const ann = annotationPositions[annIdx];
+    if (activeIsolatedId !== null && ann.cluster !== activeIsolatedId) {
+      status("This annotation belongs to a different cluster.");
+      return;
+    }
+    _pushAnnUndo(annIdx);
+    ann._deleted = true;
+    if (annIdx < annotationMarkers.length && annotationMarkers[annIdx]) {
+      annotationMarkers[annIdx].visible = false;
+    }
+    dbhCylinders.forEach(c => { if (c.userData.annIdx === annIdx) c.visible = false; });
+    const tbody = document.getElementById("clickLogTbody");
+    if (tbody) {
+      tbody.querySelectorAll("tr.ann-row").forEach(tr => {
+        if (parseInt(tr.dataset.annIdx) === annIdx) {
+          tr.style.opacity = "0.3";
+          tr.style.textDecoration = "line-through";
+        }
+      });
+    }
+    _pendingAnnReplace = -1;
+    const dbhStr = (ann._dbh || ann.dbh) ? ` (DBH=${ann._dbh || ann.dbh} preserved)` : '';
+    status(`Annotation A${annIdx+1} deleted (D)${dbhStr} — Ctrl+Z to undo.`);
+    return;
+  }
+
+  // ── Delete the nearest click marker ──
+  if (bestClickIdx >= 0) {
+    const idx = bestClickIdx;
+    const removedClick = clickedPoints[idx];
+    const marker = clickMarkers[idx];
+    const markerPos = marker.position.clone();
+    const markerScene = marker.parent || scene;
+    _pushClickRemoveUndo(removedClick, markerPos, markerScene);
+    if (marker.parent) marker.parent.remove(marker);
+    clickMarkers.splice(idx, 1);
+    clickedPoints.splice(idx, 1);
+    updateClickCount();
+    autoSaveClicks();
+    if (removedClick) removeClickLogEntry(removedClick.id);
+    status(`Click marker #${removedClick.id} deleted (D) — Ctrl+Z to undo.`);
+    return;
+  }
+
+  status("No marker near cursor. Move mouse closer to a marker and press D.");
 }
 
 function updateCoordReadout(e) {
