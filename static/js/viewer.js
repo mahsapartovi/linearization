@@ -2685,52 +2685,22 @@ function doDbhSlice() {
   dbhHiddenPoints=new Float32Array(colAttr.array);
   const arr=colAttr.array;
 
-  // Build list of tree trunk XY positions (row-local coords, same as posAttr)
-  // from annotations belonging to this cluster
-  const trunkXYs = [];
-  if (annotationPositions) {
-    annotationPositions.forEach(ann => {
-      if (ann.cluster !== activeIsolatedId) return;
-      // ann.x/y are global lin-centered; subtract centerOffset to get row-local
-      trunkXYs.push({ x: ann.x - r.centerOffset.x, y: ann.y - r.centerOffset.y });
-    });
-  }
-  // If no annotation trunks, fall back to the click marker being edited (exactX/Y are row-local)
-  if (trunkXYs.length === 0 && _editingDbhClickIdx >= 0 && clickedPoints[_editingDbhClickIdx]) {
-    const ck = clickedPoints[_editingDbhClickIdx];
-    trunkXYs.push({ x: ck.exactX, y: ck.exactY });
-  }
-
-  const trunkRadius = 0.8; // metres — keep points within this XY distance of a known trunk
-  const trunkRadSq = trunkRadius * trunkRadius;
-  const filterByTrunk = trunkXYs.length > 0;
-
   for(let i=0;i<n;i++){
     if(r.labels[i]!==activeIsolatedId) continue;
     const x=posAttr.getX(i), y=posAttr.getY(i), z=posAttr.getZ(i);
     const gz=getGroundZ(grid, x, y);
 
-    // Always hide points above the slice height
+    // Hide points above the slice height (canopy, upper branches)
     if(z > gz + dbhSliceOffset) {
       arr[i*3]=0; arr[i*3+1]=0; arr[i*3+2]=0;
       continue;
     }
 
-    if (filterByTrunk) {
-      // Only keep points near a known trunk AND above ground surface
-      let nearTrunk = false;
-      for(const t of trunkXYs) {
-        const dx = x - t.x, dy = y - t.y;
-        if(dx*dx + dy*dy < trunkRadSq) { nearTrunk = true; break; }
-      }
-      if(!nearTrunk || z < gz + 0.3) {
-        arr[i*3]=0; arr[i*3+1]=0; arr[i*3+2]=0;
-      }
-    } else {
-      // No trunk reference — show entire cluster cross-section above ground
-      if(z < gz + 0.3) {
-        arr[i*3]=0; arr[i*3+1]=0; arr[i*3+2]=0;
-      }
+    // Hide points below the ground surface (noise, ground itself)
+    // Keep everything between ground+0.3m and ground+sliceOffset — this shows
+    // ALL trunk cross-sections including unannotated trees
+    if(z < gz + 0.3) {
+      arr[i*3]=0; arr[i*3+1]=0; arr[i*3+2]=0;
     }
   }
 
