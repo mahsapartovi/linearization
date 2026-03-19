@@ -3,7 +3,7 @@ Point Cloud Viewer — Flask Backend
 Upload → Parse → Cluster → Linearize → Dual View → Click → CSV
 
 Key changes:
-  - /relinearize: overlap-only update (no re-clustering) — FAST
+  - /relinearize: overlap-only update (no re-clustering) 
   - labels[] sent with both views for client-side isolation + hover highlight
   - /isolate_cluster removed — isolation done client-side instantly
 """
