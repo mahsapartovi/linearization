@@ -753,19 +753,38 @@ function onMainDoubleClick(event) {
     }
   }
 
-  // Raycast with escalating thresholds
+  // Raycast with escalating thresholds — more steps for sparse point clouds
   let intersects=rc.intersectObject(target), threshUsed=dynThresh;
   if(!intersects.length){threshUsed=dynThresh*2;rc.params.Points.threshold=threshUsed;intersects=rc.intersectObject(target);}
   if(!intersects.length){threshUsed=dynThresh*4;rc.params.Points.threshold=threshUsed;intersects=rc.intersectObject(target);}
+  if(!intersects.length){threshUsed=Math.max(dynThresh*8, 0.15);rc.params.Points.threshold=threshUsed;intersects=rc.intersectObject(target);}
+  if(!intersects.length){threshUsed=0.4;rc.params.Points.threshold=threshUsed;intersects=rc.intersectObject(target);}
+  if(!intersects.length){threshUsed=0.8;rc.params.Points.threshold=threshUsed;intersects=rc.intersectObject(target);}
 
   // Skip invisible (black/discarded) points — the shader discards them visually but
   // Three.js raycasting still hits them, causing misses from certain viewpoints.
+  // When using wider thresholds for sparse clouds, pick the point closest to the
+  // actual mouse ray (smallest distanceToRay), not just the first hit by camera distance.
   const colAttrMain = target.geometry.attributes.color;
-  const hit = intersects.find(ix => {
-    if (!colAttrMain) return true;
-    const r = colAttrMain.getX(ix.index), g = colAttrMain.getY(ix.index), b = colAttrMain.getZ(ix.index);
-    return (r + g + b) >= 0.01;
-  });
+  let hit = null;
+  if (threshUsed > dynThresh * 2 && intersects.length > 1) {
+    // Wide threshold mode — sort by distanceToRay to find the point most directly under cursor
+    const visible = intersects.filter(ix => {
+      if (!colAttrMain) return true;
+      const r = colAttrMain.getX(ix.index), g = colAttrMain.getY(ix.index), b = colAttrMain.getZ(ix.index);
+      return (r + g + b) >= 0.01;
+    });
+    if (visible.length > 0) {
+      visible.sort((a, b) => (a.distanceToRay || 0) - (b.distanceToRay || 0));
+      hit = visible[0];
+    }
+  } else {
+    hit = intersects.find(ix => {
+      if (!colAttrMain) return true;
+      const r = colAttrMain.getX(ix.index), g = colAttrMain.getY(ix.index), b = colAttrMain.getZ(ix.index);
+      return (r + g + b) >= 0.01;
+    });
+  }
 
   if (hit) {
     const pi=hit.index;
@@ -899,8 +918,11 @@ function onRowDoubleClick(event, ri) {
 
   // ── Annotation editing: if pending replacement, use this click as new position ──
   if (_pendingAnnReplace >= 0) {
+    const baseThreshRepl = rc.params.Points.threshold;
     let intersects = rc.intersectObject(ri.row.points);
-    if (!intersects.length) { rc.params.Points.threshold *= 3; intersects = rc.intersectObject(ri.row.points); }
+    if (!intersects.length) { rc.params.Points.threshold = baseThreshRepl * 3; intersects = rc.intersectObject(ri.row.points); }
+    if (!intersects.length) { rc.params.Points.threshold = Math.max(baseThreshRepl * 6, 0.15); intersects = rc.intersectObject(ri.row.points); }
+    if (!intersects.length) { rc.params.Points.threshold = 0.5; intersects = rc.intersectObject(ri.row.points); }
     const colAttrRepl = ri.row.points.geometry.attributes.color;
     const replHit = intersects.find(ix => {
       if (!colAttrRepl) return true;
@@ -989,16 +1011,34 @@ function onRowDoubleClick(event, ri) {
     }
   }
 
+  const baseThreshRow = rc.params.Points.threshold;
   let intersects = rc.intersectObject(ri.row.points);
-  if (!intersects.length) { rc.params.Points.threshold *= 3; intersects = rc.intersectObject(ri.row.points); }
+  if (!intersects.length) { rc.params.Points.threshold = baseThreshRow * 3; intersects = rc.intersectObject(ri.row.points); }
+  if (!intersects.length) { rc.params.Points.threshold = Math.max(baseThreshRow * 6, 0.15); intersects = rc.intersectObject(ri.row.points); }
+  if (!intersects.length) { rc.params.Points.threshold = 0.4; intersects = rc.intersectObject(ri.row.points); }
+  if (!intersects.length) { rc.params.Points.threshold = 0.8; intersects = rc.intersectObject(ri.row.points); }
 
   // Skip invisible (black/discarded) points
+  // For sparse clouds with wider thresholds, pick point closest to mouse ray
   const colAttrRow = ri.row.points.geometry.attributes.color;
-  const rowHit = intersects.find(ix => {
-    if (!colAttrRow) return true;
-    const r = colAttrRow.getX(ix.index), g = colAttrRow.getY(ix.index), b = colAttrRow.getZ(ix.index);
-    return (r + g + b) >= 0.01;
-  });
+  let rowHit = null;
+  if (rc.params.Points.threshold > baseThreshRow * 2 && intersects.length > 1) {
+    const visible = intersects.filter(ix => {
+      if (!colAttrRow) return true;
+      const r = colAttrRow.getX(ix.index), g = colAttrRow.getY(ix.index), b = colAttrRow.getZ(ix.index);
+      return (r + g + b) >= 0.01;
+    });
+    if (visible.length > 0) {
+      visible.sort((a, b) => (a.distanceToRay || 0) - (b.distanceToRay || 0));
+      rowHit = visible[0];
+    }
+  } else {
+    rowHit = intersects.find(ix => {
+      if (!colAttrRow) return true;
+      const r = colAttrRow.getX(ix.index), g = colAttrRow.getY(ix.index), b = colAttrRow.getZ(ix.index);
+      return (r + g + b) >= 0.01;
+    });
+  }
 
   if (rowHit) {
     const hit = rowHit, pi = hit.index;
@@ -4147,11 +4187,12 @@ function _deleteAnnotationUnderCursor() {
   // ── Strategy: project ALL visible markers (annotations + clicks) to screen
   // and find the nearest one within a pixel radius.  This is far more reliable
   // than raycasting against the point cloud and hoping to land near an annotation.
+  // Use a tight radius (20px) to avoid grabbing the wrong marker in sparse clouds.
 
   let bestAnnIdx = -1;
   let bestClickIdx = -1;
   let bestScreenDist = Infinity;
-  const MAX_PX = 40;  // 40-pixel grab radius on screen
+  const MAX_PX = 20;  // 20-pixel grab radius — tight enough for sparse clouds
 
   // Helper: project a world-space position to screen pixels
   function _worldToScreen(pos3d, cam, rect, rowInfo) {
