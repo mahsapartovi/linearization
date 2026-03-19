@@ -96,6 +96,10 @@ let dbhCylindersVisible = false; // toolbar toggle state
 let linInstanceLabels = null;
 let _pendingAnnReplace = -1; // annotation index waiting for replacement position
 
+// Undo stack for annotation operations
+let _undoStack = [];
+const MAX_UNDO = 50;
+
 // Multi-row linearized state
 let linRows = [];              // [{scene, camera, vp, points, labels, origXYZ, clusterIds, baseColors}]
 let isRowMode = false;
@@ -858,20 +862,28 @@ function onRowDoubleClick(event, ri) {
         const hitMarker = annHits[0].object;
         const annIdx = annotationMarkers.indexOf(hitMarker);
         if (annIdx >= 0 && annIdx < annotationPositions.length) {
-          // Hide marker + cylinder
-          hitMarker.visible = false;
-          dbhCylinders.forEach(c => { if (c.userData.annIdx === annIdx) c.visible = false; });
-          // Grey out table row
-          const tbody = document.getElementById("clickLogTbody");
-          tbody.querySelectorAll("tr.ann-row").forEach(tr => {
-            if (parseInt(tr.dataset.annIdx) === annIdx) {
-              tr.style.opacity = "0.3";
-              tr.style.textDecoration = "line-through";
-            }
-          });
-          _pendingAnnReplace = annIdx;
-          status(`Annotation A${annIdx+1} removed — double-click a new position to replace it`);
-          return;
+          const ann = annotationPositions[annIdx];
+          // Validate cluster — skip if annotation belongs to different cluster
+          if (activeIsolatedId !== null && ann.cluster !== activeIsolatedId) {
+            // wrong cluster — fall through
+          } else {
+            // Push undo before modifying (preserves DBH + position)
+            _pushAnnUndo(annIdx);
+            // Hide marker + cylinder
+            hitMarker.visible = false;
+            dbhCylinders.forEach(c => { if (c.userData.annIdx === annIdx) c.visible = false; });
+            // Grey out table row
+            const tbody = document.getElementById("clickLogTbody");
+            tbody.querySelectorAll("tr.ann-row").forEach(tr => {
+              if (parseInt(tr.dataset.annIdx) === annIdx) {
+                tr.style.opacity = "0.3";
+                tr.style.textDecoration = "line-through";
+              }
+            });
+            _pendingAnnReplace = annIdx;
+            status(`Annotation A${annIdx+1} removed — double-click a new position to replace it. Ctrl+Z to undo.`);
+            return;
+          }
         }
       }
     }
@@ -1946,6 +1958,15 @@ function _pickNearestCylinder(visCyls, ndcX, ndcY, cam, vpW, vpH) {
   let best = null, bestDist = Infinity;
 
   seen.forEach(entry => {
+    // Skip entries belonging to a different cluster when isolated
+    if (activeIsolatedId !== null) {
+      if (entry.annIdx >= 0 && annotationPositions && annotationPositions[entry.annIdx]) {
+        if (annotationPositions[entry.annIdx].cluster !== activeIsolatedId) return;
+      }
+      if (entry.clickIdx >= 0 && clickedPoints && clickedPoints[entry.clickIdx]) {
+        if (clickedPoints[entry.clickIdx].clusterId !== activeIsolatedId) return;
+      }
+    }
     const ndc = entry.center.clone().project(cam);
     if (ndc.z > 1) return;   // behind camera
 
@@ -1985,6 +2006,13 @@ function _pickNearestSprite(sprites, ri, ndcX, ndcY, maxNDC, camOverride) {
   if (!cam) return null;
   let best = null, bestD = Infinity;
   sprites.forEach(sp => {
+    // Skip sprites belonging to a different cluster when isolated
+    if (activeIsolatedId !== null && annotationPositions) {
+      const spIdx = annotationMarkers.indexOf(sp);
+      if (spIdx >= 0 && spIdx < annotationPositions.length) {
+        if (annotationPositions[spIdx].cluster !== activeIsolatedId) return;
+      }
+    }
     const wp = sp.position.clone();
     wp.project(cam);
     const dx = wp.x - ndcX;
@@ -3883,6 +3911,178 @@ function clearAnnRowHighlight() {
   });
 }
 
+// ═══════════════════════════════════════════════════════════
+// ANNOTATION UNDO + D-KEY DELETE
+// ═══════════════════════════════════════════════════════════
+
+// Push current annotation state to undo stack (call BEFORE modifying).
+// DBH is never touched — it is always preserved across delete/move.
+function _pushAnnUndo(annIdx) {
+  if (!annotationPositions || annIdx < 0 || annIdx >= annotationPositions.length) return;
+  const ann = annotationPositions[annIdx];
+  const marker = (annIdx < annotationMarkers.length) ? annotationMarkers[annIdx] : null;
+  _undoStack.push({
+    annIdx: annIdx,
+    x: ann.x, y: ann.y, z: ann.z,
+    orig_x: ann.orig_x, orig_y: ann.orig_y, orig_z: ann.orig_z,
+    cluster: ann.cluster,
+    markerX: marker ? marker.position.x : 0,
+    markerY: marker ? marker.position.y : 0,
+    markerZ: marker ? marker.position.z : 0,
+    wasPendingReplace: false, // set true by delete actions
+  });
+  if (_undoStack.length > MAX_UNDO) _undoStack.shift();
+}
+
+// Ctrl+Z handler — undo last annotation operation
+function _undoLastAnnAction() {
+  if (_undoStack.length === 0) { status("Nothing to undo."); return; }
+  const u = _undoStack.pop();
+  if (!annotationPositions || u.annIdx >= annotationPositions.length) return;
+  const ann = annotationPositions[u.annIdx];
+
+  // Restore annotation position fields (DBH is never touched)
+  ann.x = u.x; ann.y = u.y; ann.z = u.z;
+  ann.orig_x = u.orig_x; ann.orig_y = u.orig_y; ann.orig_z = u.orig_z;
+  ann.cluster = u.cluster;
+
+  // Cancel any pending replacement for this annotation
+  if (_pendingAnnReplace === u.annIdx) _pendingAnnReplace = -1;
+
+  // Restore 3D marker position and visibility
+  if (u.annIdx < annotationMarkers.length && annotationMarkers[u.annIdx]) {
+    const marker = annotationMarkers[u.annIdx];
+    marker.position.set(u.markerX, u.markerY, u.markerZ);
+    const fileVis = annotationFileVisibility[ann.file] !== false;
+    const clusterOk = activeIsolatedId === null || ann.cluster === activeIsolatedId;
+    marker.visible = annotationVisible && fileVis && clusterOk;
+  }
+
+  // Restore cylinder visibility
+  dbhCylinders.forEach(c => {
+    if (c.userData.annIdx === u.annIdx) {
+      c.visible = _cylShouldBeVisible(c.userData.annIdx, c.userData.clickIdx);
+    }
+  });
+
+  // Restore table row (un-grey and update coords)
+  const tbody = document.getElementById("clickLogTbody");
+  if (tbody) {
+    tbody.querySelectorAll("tr.ann-row").forEach(tr => {
+      if (parseInt(tr.dataset.annIdx) === u.annIdx) {
+        tr.style.opacity = "";
+        tr.style.textDecoration = "";
+        const cells = tr.querySelectorAll("td");
+        if (cells.length >= 4) {
+          cells[1].textContent = Number(ann.orig_x).toFixed(3);
+          cells[2].textContent = Number(ann.orig_y).toFixed(3);
+          cells[3].textContent = Number(ann.orig_z).toFixed(3);
+        }
+        const clCell = tr.querySelector("[data-field='cluster']");
+        if (clCell) clCell.textContent = ann.cluster >= 0 ? ann.cluster : '—';
+        tr.dataset.cluster = ann.cluster;
+        // Flash blue to indicate undo
+        tr.style.background = "rgba(0,120,212,.35)";
+        tr.style.outline = "1px solid var(--acc)";
+        setTimeout(() => { tr.style.background = ""; tr.style.outline = ""; }, 1200);
+      }
+    });
+  }
+
+  status(`Undo: annotation A${u.annIdx+1} restored to (${Number(ann.orig_x).toFixed(3)}, ${Number(ann.orig_y).toFixed(3)}, ${Number(ann.orig_z).toFixed(3)})`);
+}
+
+// D key handler — delete annotation nearest to mouse cursor, keeping DBH
+function _deleteAnnotationUnderCursor() {
+  if (!annotationPositions || !annotationPositions.length) return;
+  if (_pendingAnnReplace >= 0) { status("Already in replacement mode — double-click to reposition, or Ctrl+Z to undo."); return; }
+  if (dbhTopViewMode && dbhSliceActive) return; // don't interfere with DBH editing
+
+  // Use the hovered annotation index from the mousemove tracker
+  let annIdx = _hoveredAnnIdx;
+
+  // If no hovered annotation, try raycasting from last hover event
+  if (annIdx < 0 && _lastHoverEvent && isRowMode && linRows.length > 0) {
+    const ev = _lastHoverEvent;
+    const ri = getRowAtMouse(ev.clientX, ev.clientY);
+    if (ri) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      const mx = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+      const my = -((ri.localY) / ri.rowH) * 2 + 1;
+
+      // Try hitting annotation sprites directly first
+      const visAnn = annotationMarkers.filter(m => m.parent === ri.row.scene && m.visible);
+      if (visAnn.length > 0) {
+        const rcAnn = new THREE.Raycaster();
+        rcAnn.setFromCamera(new THREE.Vector2(mx, my), ri.row.camera);
+        const annHits = rcAnn.intersectObjects(visAnn);
+        if (annHits.length > 0) {
+          const hitIdx = annotationMarkers.indexOf(annHits[0].object);
+          if (hitIdx >= 0) annIdx = hitIdx;
+        }
+      }
+
+      // Fallback: find nearest annotation by point proximity
+      if (annIdx < 0) {
+        const rc = new THREE.Raycaster();
+        rc.setFromCamera(new THREE.Vector2(mx, my), ri.row.camera);
+        const dist = ri.row.camera.position.distanceTo(ri.row.vp.pivotPoint);
+        rc.params.Points.threshold = Math.max(0.01, dist * 0.01);
+        const hits = rc.intersectObject(ri.row.points);
+        if (hits.length > 0) {
+          const pi = hits[0].index;
+          if (ri.row.origXYZ && pi * 3 + 2 < ri.row.origXYZ.length) {
+            const ox = ri.row.origXYZ[pi*3], oy = ri.row.origXYZ[pi*3+1], oz = ri.row.origXYZ[pi*3+2];
+            let bestDist = 4.0;
+            for (let i = 0; i < annotationPositions.length; i++) {
+              const a = annotationPositions[i];
+              const dx = a.orig_x - ox, dy = a.orig_y - oy, dz = a.orig_z - oz;
+              const d = Math.sqrt(dx*dx + dy*dy + dz*dz);
+              if (d < bestDist) { bestDist = d; annIdx = i; }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (annIdx < 0 || annIdx >= annotationPositions.length) {
+    status("No annotation near cursor. Hover near a tree annotation and press D.");
+    return;
+  }
+
+  const ann = annotationPositions[annIdx];
+  // Validate cluster isolation
+  if (activeIsolatedId !== null && ann.cluster !== activeIsolatedId) {
+    status("This annotation belongs to a different cluster.");
+    return;
+  }
+
+  // Push undo (preserves position + DBH)
+  _pushAnnUndo(annIdx);
+
+  // Hide marker + cylinder
+  if (annIdx < annotationMarkers.length && annotationMarkers[annIdx]) {
+    annotationMarkers[annIdx].visible = false;
+  }
+  dbhCylinders.forEach(c => { if (c.userData.annIdx === annIdx) c.visible = false; });
+
+  // Grey out table row
+  const tbody = document.getElementById("clickLogTbody");
+  if (tbody) {
+    tbody.querySelectorAll("tr.ann-row").forEach(tr => {
+      if (parseInt(tr.dataset.annIdx) === annIdx) {
+        tr.style.opacity = "0.3";
+        tr.style.textDecoration = "line-through";
+      }
+    });
+  }
+
+  _pendingAnnReplace = annIdx;
+  const dbhStr = (ann._dbh || ann.dbh) ? ` (DBH=${ann._dbh || ann.dbh} preserved)` : '';
+  status(`Annotation A${annIdx+1} deleted (D)${dbhStr} — double-click to reposition, Ctrl+Z to undo.`);
+}
+
 function updateCoordReadout(e) {
   const el = document.getElementById("coordText");
   if (isRowMode && activeIsolatedId === null) {
@@ -4459,12 +4659,15 @@ function setupToolbar() {
 function onKeyDown(e) {
   if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT") return;
   if (e.ctrlKey && e.key === "o") { e.preventDefault(); openUploadModal('task2'); return; }
+  // Ctrl+Z — undo last annotation operation
+  if (e.ctrlKey && (e.key === "z" || e.key === "Z")) { e.preventDefault(); _undoLastAnnAction(); return; }
   switch (e.key) {
     case "f": case "F": fitAll(); break;
     case "r": case "R": resetView(); break;
     case "g": case "G": toggleGrid(); break;
     case "a": case "A": toggleAxes(); break;
     case "l": case "L": toggleLighting(); break;
+    case "d": case "D": _deleteAnnotationUnderCursor(); break;
     // +/- reserved for DBH circle fitting only
     case "1": setView("top"); break; case "2": setView("front"); break; case "3": setView("right"); break;
     case "Escape": clearIsolation(); break;
