@@ -633,7 +633,7 @@ def recluster():
     data = request.get_json()
     cid = data.get('cloud_id')
     grid_res = float(data.get('grid_resolution', 0.6))
-    overlap = max(-0.5, min(0.5, float(data.get('overlap', 0.15))))
+    overlap = max(-1.0, min(0.5, float(data.get('overlap', 0.15))))
     if cid not in cloud_store: return jsonify({'error': 'Cloud not found'}), 404
     store = cloud_store[cid]
     pts = store['raw_pts']
@@ -657,7 +657,7 @@ def relinearize():
     """FAST overlap-only update — reuses existing labels, skips clustering entirely."""
     data = request.get_json()
     cid = data.get('cloud_id')
-    overlap = max(-0.5, min(0.5, float(data.get('overlap', 0.15))))
+    overlap = max(-1.0, min(0.5, float(data.get('overlap', 0.15))))
     if cid not in cloud_store: return jsonify({'error': 'Cloud not found'}), 404
     store = cloud_store[cid]
     store['overlap'] = overlap
