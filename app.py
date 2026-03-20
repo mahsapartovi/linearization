@@ -436,6 +436,7 @@ def upload_raw():
         else: meta['color_mode'] = 'rgb'
 
         # Handle optional annotation / ground truth file(s) — each PLY = one tree
+        # We save the original and create a working copy to preserve the original untouched
         annotation_info = None
         ann_files = request.files.getlist('annotation')
         if ann_files and ann_files[0].filename != '':
@@ -443,8 +444,13 @@ def upload_raw():
             for ann_file in ann_files:
                 if ann_file.filename == '': continue
                 ann_fn = secure_filename(ann_file.filename)
-                ann_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{uid}_ann_{ann_fn}")
-                ann_file.save(ann_path)
+                # Save original annotation file
+                ann_orig_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{uid}_ann_orig_{ann_fn}")
+                ann_file.save(ann_orig_path)
+                # Create a working copy (all edits happen on this copy, original is preserved)
+                import shutil
+                ann_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{uid}_ann_work_{ann_fn}")
+                shutil.copy2(ann_orig_path, ann_path)
                 try:
                     ann_ext = ann_fn.rsplit('.', 1)[1].lower() if '.' in ann_fn else ''
 
@@ -509,6 +515,12 @@ def upload_raw():
 
         # Store pts_mean for centering annotation positions in raw view
         pts_mean = pts.mean(0)
+
+        # Clear any previously saved clicks for this filename (fresh study)
+        safe_click_name = secure_filename(fn)
+        click_path = os.path.join(clicks_dir, f"{safe_click_name}.json")
+        if os.path.exists(click_path):
+            os.remove(click_path)
 
         cloud_store[uid] = {
             'raw_pts': pts, 'raw_cols': cols, 'meta': meta,
