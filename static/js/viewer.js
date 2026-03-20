@@ -2135,7 +2135,7 @@ function onAnnotationRightClick(e) {
         const halfH = Math.tan(fovRad / 2);
         const ndcPerPx = (2 * halfH * dist) / ri.rowH;
         const threshold = Math.min(0.12, Math.max(0.02, ndcPerPx * 12));
-        const hitMarker = _pickNearestSprite(visMarkers, ri, mx, my, threshold);
+        const hitMarker = _pickNearestSprite(visMarkers, ri, mx, my, threshold, null, rect.width, ri.rowH);
         if (hitMarker !== null) {
           e.stopPropagation();
           _ctxAnnIdx = annotationMarkers.indexOf(hitMarker);
@@ -2207,7 +2207,7 @@ function onAnnotationRightClick(e) {
       const halfH = Math.tan(fovRad / 2);
       const ndcPerPx = (2 * halfH * dist) / rect.height;
       const threshold = Math.min(0.12, Math.max(0.02, ndcPerPx * 12));
-      const hitMarker = _pickNearestSprite(visMarkers, null, mx, my, threshold, camera);
+      const hitMarker = _pickNearestSprite(visMarkers, null, mx, my, threshold, camera, rect.width, rect.height);
       if (hitMarker !== null) {
         e.stopPropagation();
         _ctxAnnIdx = annotationMarkers.indexOf(hitMarker);
@@ -2299,10 +2299,23 @@ function _pickNearestCylinder(visCyls, ndcX, ndcY, cam, vpW, vpH) {
 }
 
 // ri is the row info object (provides ri.row.camera); pass null + camOverride for main-view use.
-function _pickNearestSprite(sprites, ri, ndcX, ndcY, maxNDC, camOverride) {
+// Screen-space sprite picker.
+// For each sprite, projects its centre to screen space and computes the hit radius
+// from the sprite's actual world-space scale at its own depth — NOT from a fixed
+// threshold based on pivot distance.  This makes file-loaded annotations (which can
+// be far from the pivot) picked just as accurately as manually placed ones.
+// vpW / vpH are the viewport pixel dimensions used for the NDC→pixel conversion.
+// maxNDC is kept as a hard cap (safety valve) but is secondary to the per-sprite radius.
+function _pickNearestSprite(sprites, ri, ndcX, ndcY, maxNDC, camOverride, vpW, vpH) {
   const cam = camOverride || (ri && ri.row.camera);
   if (!cam) return null;
-  let best = null, bestD = Infinity;
+
+  // Resolve viewport dimensions for pixel-space conversion
+  const rect = renderer.domElement.getBoundingClientRect();
+  const halfW = (vpW || rect.width)  / 2;
+  const halfH = (vpH || (ri ? ri.rowH : rect.height)) / 2;
+
+  let best = null, bestDist = Infinity;
   sprites.forEach(sp => {
     // Skip sprites belonging to a different cluster when isolated
     if (activeIsolatedId !== null && annotationPositions) {
@@ -2311,12 +2324,37 @@ function _pickNearestSprite(sprites, ri, ndcX, ndcY, maxNDC, camOverride) {
         if (annotationPositions[spIdx].cluster !== activeIsolatedId) return;
       }
     }
-    const wp = sp.position.clone();
-    wp.project(cam);
-    const dx = wp.x - ndcX;
-    const dy = wp.y - ndcY;
-    const d = Math.sqrt(dx * dx + dy * dy);
-    if (d < maxNDC && d < bestD) { bestD = d; best = sp; }
+
+    const ndc = sp.position.clone().project(cam);
+    if (ndc.z > 1) return; // behind camera
+
+    // Compute the sprite's projected radius in pixels from its world-space scale.
+    // Sprite scale is uniform (scale.x = scale.y = world diameter), so radius = scale.x/2.
+    const worldRadius = sp.scale.x / 2;
+    const offPt = sp.position.clone();
+    offPt.x += worldRadius;
+    const offNdc = offPt.clone().project(cam);
+    // Pixel radius on X axis; also check Y in case the view is orthographic-like
+    const offPtY = sp.position.clone();
+    offPtY.y += worldRadius;
+    const offNdcY = offPtY.clone().project(cam);
+    const rPxX = Math.abs(offNdc.x  - ndc.x) * halfW;
+    const rPxY = Math.abs(offNdcY.y - ndc.y) * halfH;
+    // Use the larger of the two axes (sprite is round, take the most generous)
+    const rPx = Math.max(rPxX, rPxY, 4); // floor: 4 px so tiny sprites stay clickable
+
+    // Cap at maxNDC converted to pixels to avoid picking across huge distances
+    const maxPx = maxNDC * halfH * 2;
+
+    // Pixel distance from mouse to sprite centre
+    const dx = (ndcX - ndc.x) * halfW;
+    const dy = (ndcY - ndc.y) * halfH;
+    const distPx = Math.sqrt(dx * dx + dy * dy);
+
+    if (distPx <= Math.min(rPx, maxPx) && distPx < bestDist) {
+      bestDist = distPx;
+      best = sp;
+    }
   });
   return best;
 }
