@@ -760,6 +760,7 @@ function onMainDoubleClick(event) {
         const markerScene = hit.parent || scene;
         // Push undo BEFORE removing
         if (removedClick) _pushClickRemoveUndo(removedClick, markerPos, markerScene);
+        _removeClickCylinders(idx);
         scene.remove(hit); clickMarkers.splice(idx,1);
         clickedPoints.splice(idx,1);
         updateClickCount();
@@ -1019,6 +1020,7 @@ function onRowDoubleClick(event, ri) {
         const markerScene = hit.parent || ri.row.scene;
         // Push undo BEFORE removing
         if (removedClick) _pushClickRemoveUndo(removedClick, markerPos, markerScene);
+        _removeClickCylinders(idx);
         ri.row.scene.remove(hit); clickMarkers.splice(idx, 1);
         clickedPoints.splice(idx, 1);
         updateClickCount(); autoSaveClicks();
@@ -1960,6 +1962,20 @@ function buildDbhCylinders() {
   });
 }
 
+// Auto-enable DBH cylinders if any loaded annotation already has a DBH value.
+// Called after buildAnnotationMarkers() / buildDbhCylinders() on every file load.
+function _autoEnableDbhIfNeeded() {
+  if (dbhCylindersVisible) return;  // already on
+  const hasDbh = (annotationPositions && annotationPositions.some(a => a.dbh != null || a._dbh != null))
+               || (clickedPoints && clickedPoints.some(c => c.dbh != null));
+  if (!hasDbh) return;
+  dbhCylindersVisible = true;
+  buildDbhCylinders();
+  dbhCylinders.forEach(m => { m.visible = _cylShouldBeVisible(m.userData.annIdx, m.userData.clickIdx); });
+  const btn = document.getElementById('tbCylinders');
+  if (btn) btn.classList.add('active');
+}
+
 function toggleDbhCylinders() {
   dbhCylindersVisible = !dbhCylindersVisible;
   // Rebuild cylinders if array is empty (e.g. cleared by scene rebuild)
@@ -2083,20 +2099,30 @@ function onAnnotationRightClick(e) {
       }
     }
 
-    // 2. Click markers (red spheres placed by double-click)
+    // 2. Click markers (red spheres) — screen-space projected-sphere pick
     const rowClickMarkers = clickMarkers.filter(m => m.parent === ri.row.scene && m.visible);
     if (rowClickMarkers.length) {
-      const hits = rc.intersectObjects(rowClickMarkers, true);
-      if (hits.length > 0) {
-        let hit = hits[0].object;
-        while (hit.parent && !hit.userData.isClickMarker) hit = hit.parent;
-        const idx = clickMarkers.indexOf(hit);
-        if (idx !== -1) {
-          e.stopPropagation();
-          _ctxClickIdx = idx;
-          _showAnnotationContextMenu(_clickHasDbh(idx), e.clientX, e.clientY);
-          return;
+      const rect2b = renderer.domElement.getBoundingClientRect();
+      const halfW2 = rect2b.width / 2, halfH2 = ri.rowH / 2;
+      let bestIdx = -1, bestDist2 = Infinity;
+      rowClickMarkers.forEach(m => {
+        const ndc = m.position.clone().project(ri.row.camera);
+        if (ndc.z > 1) return;
+        const sz = (m.userData.baseSize || 0.05);
+        const offPt = m.position.clone(); offPt.x += sz;
+        const rPx = Math.abs(offPt.clone().project(ri.row.camera).x - ndc.x) * halfW2;
+        const dx = (mx - ndc.x) * halfW2;
+        const dy = (my - ndc.y) * halfH2;
+        const dist2 = Math.sqrt(dx * dx + dy * dy);
+        if (dist2 <= Math.max(rPx, 6) && dist2 < bestDist2) {
+          bestDist2 = dist2; bestIdx = clickMarkers.indexOf(m);
         }
+      });
+      if (bestIdx !== -1) {
+        e.stopPropagation();
+        _ctxClickIdx = bestIdx;
+        _showAnnotationContextMenu(_clickHasDbh(bestIdx), e.clientX, e.clientY);
+        return;
       }
     }
 
@@ -2108,7 +2134,7 @@ function onAnnotationRightClick(e) {
         const fovRad = ri.row.camera.fov * Math.PI / 180;
         const halfH = Math.tan(fovRad / 2);
         const ndcPerPx = (2 * halfH * dist) / ri.rowH;
-        const threshold = Math.min(0.35, Math.max(0.04, ndcPerPx * 30));
+        const threshold = Math.min(0.12, Math.max(0.02, ndcPerPx * 12));
         const hitMarker = _pickNearestSprite(visMarkers, ri, mx, my, threshold);
         if (hitMarker !== null) {
           e.stopPropagation();
@@ -2146,20 +2172,29 @@ function onAnnotationRightClick(e) {
     }
   }
 
-  // Click markers in main scene
+  // Click markers in main scene — screen-space projected-sphere pick
   const mainClickMarkers = clickMarkers.filter(m => m.parent === scene && m.visible);
   if (mainClickMarkers.length) {
-    const hits = rc.intersectObjects(mainClickMarkers, true);
-    if (hits.length > 0) {
-      let hit = hits[0].object;
-      while (hit.parent && !hit.userData.isClickMarker) hit = hit.parent;
-      const idx = clickMarkers.indexOf(hit);
-      if (idx !== -1) {
-        e.stopPropagation();
-        _ctxClickIdx = idx;
-        _showAnnotationContextMenu(_clickHasDbh(idx), e.clientX, e.clientY);
-        return;
+    const halfWm = rect.width / 2, halfHm = rect.height / 2;
+    let bestIdxM = -1, bestDistM = Infinity;
+    mainClickMarkers.forEach(m => {
+      const ndc = m.position.clone().project(camera);
+      if (ndc.z > 1) return;
+      const sz = (m.userData.baseSize || 0.05);
+      const offPt = m.position.clone(); offPt.x += sz;
+      const rPx = Math.abs(offPt.clone().project(camera).x - ndc.x) * halfWm;
+      const dx = (mx - ndc.x) * halfWm;
+      const dy = (my - ndc.y) * halfHm;
+      const dist2 = Math.sqrt(dx * dx + dy * dy);
+      if (dist2 <= Math.max(rPx, 6) && dist2 < bestDistM) {
+        bestDistM = dist2; bestIdxM = clickMarkers.indexOf(m);
       }
+    });
+    if (bestIdxM !== -1) {
+      e.stopPropagation();
+      _ctxClickIdx = bestIdxM;
+      _showAnnotationContextMenu(_clickHasDbh(bestIdxM), e.clientX, e.clientY);
+      return;
     }
   }
 
@@ -2171,7 +2206,7 @@ function onAnnotationRightClick(e) {
       const fovRad = camera.fov * Math.PI / 180;
       const halfH = Math.tan(fovRad / 2);
       const ndcPerPx = (2 * halfH * dist) / rect.height;
-      const threshold = Math.min(0.35, Math.max(0.04, ndcPerPx * 30));
+      const threshold = Math.min(0.12, Math.max(0.02, ndcPerPx * 12));
       const hitMarker = _pickNearestSprite(visMarkers, null, mx, my, threshold, camera);
       if (hitMarker !== null) {
         e.stopPropagation();
@@ -2218,7 +2253,10 @@ function _pickNearestCylinder(visCyls, ndcX, ndcY, cam, vpW, vpH) {
     seen.set(key, { center: obj.position.clone(), radius, annIdx: aIdx, clickIdx: cIdx });
   });
 
-  const aspect = vpW / vpH;
+  // Aspect ratio: NDC x-axis spans [-1,1] over vpW pixels, y-axis over vpH pixels.
+  // To compare distances uniformly in pixel space, scale NDC by half-dimensions.
+  const halfW = vpW / 2;
+  const halfH = vpH / 2;
   let best = null, bestDist = Infinity;
 
   seen.forEach(entry => {
@@ -2234,29 +2272,25 @@ function _pickNearestCylinder(visCyls, ndcX, ndcY, cam, vpW, vpH) {
     const ndc = entry.center.clone().project(cam);
     if (ndc.z > 1) return;   // behind camera
 
-    // Convert physical radius to NDC units at this depth.
-    // Project a point offset by `radius` in world X, compare NDC distance.
-    const offPt = entry.center.clone();
-    offPt.x += entry.radius;
-    const offNdc = offPt.project(cam);
-    const radiusNdcX = Math.abs(offNdc.x - ndc.x);
-    // Also try Y offset for robustness (e.g. vertical cylinder axis)
-    const offPtY = entry.center.clone();
-    offPtY.y += entry.radius;
-    const offNdcY = offPtY.project(cam);
-    const radiusNdcY = Math.abs(offNdcY.y - ndc.y);
-    // Use the larger projected radius (most permissive for oblique views)
-    const radiusNdc = Math.max(radiusNdcX, radiusNdcY, 0.01);
+    // Project a point offset by `radius` in world X and Y to get NDC radius on each axis,
+    // then convert to pixels for a consistent comparison.
+    const offPtX = entry.center.clone(); offPtX.x += entry.radius;
+    const radiusPxX = Math.abs(offPtX.clone().project(cam).x - ndc.x) * halfW;
 
-    // Pixel-space distance from mouse to cylinder centre (aspect-corrected)
-    const dx = (ndcX - ndc.x) * aspect;
-    const dy = (ndcY - ndc.y);
-    const distNdc = Math.sqrt(dx * dx + dy * dy);
+    const offPtY = entry.center.clone(); offPtY.y += entry.radius;
+    const radiusPxY = Math.abs(offPtY.clone().project(cam).y - ndc.y) * halfH;
 
-    // Hit if within the projected disc radius (plus a small fixed tolerance in NDC)
-    const tolerance = 0.02;
-    if (distNdc <= radiusNdc + tolerance && distNdc < bestDist) {
-      bestDist = distNdc;
+    // Use the smaller projected axis as the hit radius — keeps pick tight
+    // (max would be too permissive from side-on views where one axis collapses)
+    const radiusPx = Math.max(Math.min(radiusPxX, radiusPxY), 4);  // floor: 4 px
+
+    // Pixel distance from mouse to cylinder centre
+    const dx = (ndcX - ndc.x) * halfW;
+    const dy = (ndcY - ndc.y) * halfH;
+    const distPx = Math.sqrt(dx * dx + dy * dy);
+
+    if (distPx <= radiusPx && distPx < bestDist) {
+      bestDist = distPx;
       best = entry;
     }
   });
@@ -2357,6 +2391,14 @@ function editDbhForClick(clickIdx) {
       status(`${_editingDbhOldValue ? 'Editing' : 'Adding'} DBH for click #${click.id} — dbl-click trunk to place circle.`);
     }, 150);
   }, 100);
+}
+
+// Remove all DBH cylinders associated with a click marker index.
+// Call this before splicing the marker out of clickMarkers/clickedPoints.
+function _removeClickCylinders(clickIdx) {
+  const toRemove = dbhCylinders.filter(c => c.userData.clickIdx === clickIdx);
+  toRemove.forEach(c => { if (c.parent) c.parent.remove(c); });
+  dbhCylinders = dbhCylinders.filter(c => c.userData.clickIdx !== clickIdx);
 }
 
 function removeDbhForClick(clickIdx) {
@@ -3471,7 +3513,7 @@ function loadCloud(data) {
   fitCamera(clusterPoints, cCamera, clsVP);
   updateDBTree(); showMainProps(); showClusterProps(data.cluster_stats, data.cluster_colors);
   document.getElementById("pEpsParam").value = lastEpsParam;
-  document.getElementById("pOverlap").value = data.overlap || 0.15;
+  document.getElementById("pOverlap").value = data.overlap || -0.15;
   document.getElementById("btnRecluster").textContent = "Re-Cluster";
   document.getElementById("btnApplyOverlap").disabled = false;
   activeIsolatedId = null;
@@ -3493,6 +3535,7 @@ function loadCloud(data) {
     annotationPositions.forEach(a => { if (annotationFileVisibility[a.file] === undefined) annotationFileVisibility[a.file] = true; });
     buildAnnotationMarkers();
     addAnnotationLogEntries(annotationPositions);
+    _autoEnableDbhIfNeeded();
   }
   updateDBTree();  // refresh to show annotation files
 
@@ -3567,6 +3610,7 @@ function loadRawCloud(data) {
       annotationMarkers.push(marker);
     });
     buildDbhCylinders();
+    _autoEnableDbhIfNeeded();
     addAnnotationLogEntries(annotationPositions);
   }
 
@@ -3878,7 +3922,7 @@ function setupRecluster() {
     lastEpsParam = gr;
     showLoading(isRawMode ? "Clustering & linearizing…" : "Re-clustering…");
     fetch("/recluster", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cloud_id: cloudId, grid_resolution: gr, overlap: isNaN(ov) ? 0.15 : ov }) })
+      body: JSON.stringify({ cloud_id: cloudId, grid_resolution: gr, overlap: isNaN(ov) ? -0.15 : ov }) })
     .then(r => r.json()).then(d => {
       hideLoading();
       if (d.error) { status("Error: " + d.error); return; }
@@ -3910,7 +3954,7 @@ function setupRecluster() {
     const ov = parseFloat(document.getElementById("pOverlap").value);
     status("Applying overlap…");
     fetch("/relinearize", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cloud_id: cloudId, overlap: isNaN(ov) ? 0.15 : ov }) })
+      body: JSON.stringify({ cloud_id: cloudId, overlap: isNaN(ov) ? -0.15 : ov }) })
     .then(r => r.json()).then(d => {
       if (d.error) { status("Error: " + d.error); return; }
       reloadViews(d);
@@ -3992,10 +4036,12 @@ function reloadViews(d) {
     annotationPositions.forEach(a => { if (annotationFileVisibility[a.file] === undefined) annotationFileVisibility[a.file] = true; });
     buildAnnotationMarkers();
     addAnnotationLogEntries(annotationPositions);
+    _autoEnableDbhIfNeeded();
   } else if (annotationPositions && annotationPositions.length > 0) {
     // No new positions from server — rebuild markers using existing coords
     buildAnnotationMarkers();
     addAnnotationLogEntries(annotationPositions);
+    _autoEnableDbhIfNeeded();
   }
   updateDBTree();
 
@@ -4443,6 +4489,7 @@ function _undoLastAnnAction() {
     const idx = clickedPoints.findIndex(c => c.id === clickId);
     if (idx !== -1) {
       const marker = clickMarkers[idx];
+      _removeClickCylinders(idx);
       if (marker && marker.parent) marker.parent.remove(marker);
       clickMarkers.splice(idx, 1);
       clickedPoints.splice(idx, 1);
@@ -4634,6 +4681,7 @@ function _deleteAnnotationUnderCursor() {
     const markerPos = marker.position.clone();
     const markerScene = marker.parent || scene;
     _pushClickRemoveUndo(removedClick, markerPos, markerScene);
+    _removeClickCylinders(idx);
     if (marker.parent) marker.parent.remove(marker);
     clickMarkers.splice(idx, 1);
     clickedPoints.splice(idx, 1);
