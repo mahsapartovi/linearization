@@ -1231,6 +1231,17 @@ function repositionMarkersInRows() {
     }
     if (!targetRow) { m.visible = false; return; }
 
+    // If this click has a confirmed DBH, its exactX/Y/Z is already set to the
+    // cylinder position by confirmDbhCircle — use it directly instead of
+    // re-deriving from the point cloud (which would put it back at the original height)
+    if (click.dbh != null && click.exactX !== undefined) {
+      if (m.parent) m.parent.remove(m);
+      targetRow.scene.add(m);
+      m.position.set(click.exactX, click.exactY, click.exactZ);
+      m.visible = true;
+      return;
+    }
+
     // Find nearest point in this row by original XYZ
     const posAttr = targetRow.points.geometry.attributes.position;
     const n = targetRow.origXYZ.length / 3;
@@ -1792,8 +1803,7 @@ function clearDbhCylinders() {
 
 function _cylShouldBeVisible(annIdx, clickIdx) {
   if (!dbhCylindersVisible) return false;
-  // If annotations are globally hidden via eye toggle, hide all cylinders too
-  if (!annotationVisible) return false;
+  // DBH cylinders are independent from the annotation eye toggle — controlled only by 🌳 button
   // Click-marker cylinder (no annotation)
   if (annIdx === -1 || annIdx === undefined) {
     if (clickIdx === undefined || clickIdx < 0 || !clickedPoints[clickIdx]) return false;
@@ -1830,24 +1840,6 @@ function _cylShouldBeVisible(annIdx, clickIdx) {
 function buildDbhCylinders() {
   clearDbhCylinders();
 
-  // Helper: compute local ground Z for a given XY position within a row's cluster
-  function _localGroundZ(targetRow, clusterId, lx, ly) {
-    if (!targetRow || clusterId === undefined || clusterId < 0) return null;
-    const posAttr = targetRow.points.geometry.attributes.position;
-    const n = targetRow.labels.length;
-    let minZ = Infinity;
-    const searchRadius = 3.0; // meters
-    for (let i = 0; i < n; i++) {
-      if (targetRow.labels[i] !== clusterId) continue;
-      const px = posAttr.getX(i), py = posAttr.getY(i), pz = posAttr.getZ(i);
-      const dx = px - lx, dy = py - ly;
-      if (dx*dx + dy*dy < searchRadius * searchRadius) {
-        if (pz < minZ) minZ = pz;
-      }
-    }
-    return minZ < Infinity ? minZ : null;
-  }
-
   // ── Click-marker DBH cylinders ────────────────────────────────────────────
   if (clickedPoints && clickedPoints.length > 0) {
     clickedPoints.forEach((ck, clickIdx) => {
@@ -1862,12 +1854,9 @@ function buildDbhCylinders() {
         if (!targetRow && linRows.length > 0) targetRow = linRows[0];
       }
       const targetScene = targetRow ? targetRow.scene : scene;
-      // exactX/Y/Z are row-local (same coord system as posAttr)
-      const lx = ck.exactX, ly = ck.exactY;
-      // Compute ground Z and place cylinder at ground + 1.5m
-      let lz = ck.exactZ;
-      const groundZ = _localGroundZ(targetRow, ck.clusterId, lx, ly);
-      if (groundZ !== null) lz = groundZ + 1.5;
+      // Use the click marker's exact position — after DBH confirm, this is already
+      // set to the cylinder position the user chose. Do NOT recompute from ground.
+      const lx = ck.exactX, ly = ck.exactY, lz = ck.exactZ;
       const height = 1.0;
       const color = new THREE.Color(document.getElementById('markerColor').value || '#ff69b4');
       const geo = new THREE.CylinderGeometry(radius, radius, height, 32, 1, true);
@@ -1923,13 +1912,11 @@ function buildDbhCylinders() {
     const offX = targetRow ? targetRow.centerOffset.x : 0;
     const offY = targetRow ? targetRow.centerOffset.y : 0;
     const offZ = targetRow ? targetRow.centerOffset.z : 0;
+    // Use the annotation's own position — after DBH confirm, this is already set to
+    // the cylinder position the user chose. Do NOT recompute from ground.
     const lx = ann.x - offX;
     const ly = ann.y - offY;
-    // Compute ground Z and place cylinder at ground + 1.5m instead of annotation height
-    let lz = ann.z - offZ;
-    const annCluster = ann.cluster !== undefined ? ann.cluster : -1;
-    const groundZ = _localGroundZ(targetRow, annCluster, lx, ly);
-    if (groundZ !== null) lz = groundZ + 1.5;
+    const lz = ann.z - offZ;
 
     // Cylinder height: use 1 m as a visual reference slice
     const height = 1.0;
@@ -2583,14 +2570,7 @@ function toggleAnnotationVisibility(visible) {
       m.visible = true;
     }
   });
-  // Also toggle DBH cylinders alongside annotations
-  dbhCylinders.forEach(m => {
-    if (annotationVisible) {
-      m.visible = _cylShouldBeVisible(m.userData.annIdx, m.userData.clickIdx);
-    } else {
-      m.visible = false;
-    }
-  });
+  // DBH cylinders are independent — controlled only by the 🌳 toggle button, not the eye icon
 }
 
 function toggleAnnotationFile(filename, visible) {
