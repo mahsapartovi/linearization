@@ -285,6 +285,24 @@ function init() {
   setupCylinderContextMenu();
   window.addEventListener("resize", onResize);
   document.getElementById("clearIsolation").addEventListener("click", clearIsolation);
+  // Keep isolatedBanner positioned correctly as user scrolls in row mode
+  const vpContainer = document.getElementById("viewportContainer");
+  if (vpContainer) {
+    vpContainer.addEventListener("scroll", () => {
+      if (!isRowMode || activeIsolatedId === null || linRows.length === 0) return;
+      const banner = document.getElementById("isolatedBanner");
+      if (banner.style.display === "none") return;
+      // Find the row with the isolated cluster
+      for (let ri = 0; ri < linRows.length; ri++) {
+        if (linRows[ri].clusterIds.includes(activeIsolatedId)) {
+          const rowH = effectiveRowHeight();
+          const rowTop = ri * (rowH + ROW_GAP);
+          banner.style.top = (rowTop - vpContainer.scrollTop + 8) + "px";
+          break;
+        }
+      }
+    });
+  }
   animate();
   status("Ready — File → Open to begin. Double-click to mark points.");
 }
@@ -1183,11 +1201,28 @@ function repositionMarkersInRows() {
     const ox = click.originalX, oy = click.originalY, oz = click.originalZ;
     if (ox === '' || ox === undefined) { m.visible = false; return; }
 
-    // During isolation, only show markers for the isolated cluster
+    // During isolation, use row-aware logic: hide only in the SAME row as isolated cluster
     if (activeIsolatedId !== null && click.clusterId !== activeIsolatedId) {
-      m.visible = false;
-      return;
+      if (isRowMode && linRows.length > 0) {
+        let clickRow = null, isoRow = null;
+        for (const r of linRows) {
+          if (click.clusterId !== undefined && click.clusterId >= 0 && r.clusterIds.includes(click.clusterId)) clickRow = r;
+          if (r.clusterIds.includes(activeIsolatedId)) isoRow = r;
+        }
+        if (clickRow && isoRow && clickRow === isoRow) {
+          // Same row as isolated cluster — hide non-matching
+          m.visible = false;
+          return;
+        }
+        // Different row — keep visible (fall through)
+      } else {
+        m.visible = false;
+        return;
+      }
     }
+
+    // Respect annotationVisible (eye toggle)
+    if (!annotationVisible) { m.visible = false; return; }
 
     // Find which row contains this click's cluster
     let targetRow = null;
@@ -1511,6 +1546,7 @@ function addClickLogEntry(clickData) {
   tr.innerHTML = `<td class="cle-id">${clickData.id}</td><td>${ox}</td><td>${oy}</td><td>${oz}</td><td class="editable" contenteditable="true" data-field="cluster">${clickData.clusterId}</td><td class="dbh-cell">—</td><td>Click</td>`;
   setupRowDragDrop(tr);
   setupRowContextMenu(tr);
+  setupRowHoverHighlight(tr);
   tbody.appendChild(tr);
   // Apply current filter
   if (activeIsolatedId !== null && clickData.clusterId !== activeIsolatedId) tr.style.display = "none";
@@ -1546,6 +1582,7 @@ function addAnnotationLogEntries(annPositions) {
     tr.innerHTML = `<td>A${i+1}</td><td>${Number(ann.orig_x).toFixed(3)}</td><td>${Number(ann.orig_y).toFixed(3)}</td><td>${Number(ann.orig_z).toFixed(3)}</td><td class="editable" contenteditable="true" data-field="cluster">${clStr}</td><td class="dbh-cell">${dbhVal}</td><td>Annotation</td>`;
     setupRowDragDrop(tr);
     setupRowContextMenu(tr);
+    setupRowHoverHighlight(tr);
     // Apply current filter
     if (activeIsolatedId !== null && ann.cluster !== activeIsolatedId) tr.style.display = "none";
     tbody.appendChild(tr);
@@ -1603,33 +1640,111 @@ function setupRowContextMenu(tr) {
   });
 }
 
+// Highlight 3D tree/marker when hovering a table row
+let _tableHoverHighlightObj = null; // the object we're pulsing
+function setupRowHoverHighlight(tr) {
+  tr.addEventListener('mouseenter', () => {
+    clearTableHoverHighlight();
+    // If annotations are globally hidden, only highlight the row visually — don't show 3D markers
+    const rowType = tr.dataset.rowType;
+    if (rowType === 'ann') {
+      const annIdx = parseInt(tr.dataset.annIdx);
+      if (annIdx >= 0 && annIdx < annotationMarkers.length && annotationMarkers[annIdx]) {
+        const marker = annotationMarkers[annIdx];
+        const ann = annotationPositions && annotationPositions[annIdx];
+        if (ann && !ann._deleted) {
+          const wasVisible = marker.visible;
+          // Temporarily show and scale up — but ONLY this one marker
+          marker.visible = true;
+          marker.scale.setScalar(marker.scale.x * 2.0);
+          _tableHoverHighlightObj = { type: 'ann', idx: annIdx, origScale: marker.scale.x / 2.0, wasVisible: wasVisible };
+        }
+      }
+    } else if (rowType === 'click') {
+      const clickId = parseInt(tr.dataset.clickId);
+      const idx = clickedPoints.findIndex(c => c.id === clickId);
+      if (idx >= 0 && idx < clickMarkers.length && clickMarkers[idx]) {
+        const marker = clickMarkers[idx];
+        const wasVisible = marker.visible;
+        marker.visible = true;
+        marker.scale.setScalar(marker.scale.x * 2.0);
+        _tableHoverHighlightObj = { type: 'click', idx: idx, origScale: marker.scale.x / 2.0, wasVisible: wasVisible };
+      }
+    }
+    // Highlight the row visually
+    tr.style.background = "rgba(0,180,80,.25)";
+    tr.style.outline = "1px solid #4fc";
+  });
+  tr.addEventListener('mouseleave', () => {
+    clearTableHoverHighlight();
+    tr.style.background = "";
+    tr.style.outline = "";
+  });
+}
+
+function clearTableHoverHighlight() {
+  if (!_tableHoverHighlightObj) return;
+  const h = _tableHoverHighlightObj;
+  if (h.type === 'ann' && h.idx < annotationMarkers.length && annotationMarkers[h.idx]) {
+    const marker = annotationMarkers[h.idx];
+    marker.scale.setScalar(h.origScale);
+    // Restore to the visibility state it had BEFORE the hover
+    marker.visible = h.wasVisible;
+  } else if (h.type === 'click' && h.idx < clickMarkers.length && clickMarkers[h.idx]) {
+    clickMarkers[h.idx].scale.setScalar(h.origScale);
+    // Restore to the visibility state it had BEFORE the hover
+    clickMarkers[h.idx].visible = h.wasVisible;
+  }
+  _tableHoverHighlightObj = null;
+}
+
 function setupContextMenuActions() {
   document.addEventListener("click", () => {
     document.getElementById("rowContextMenu").style.display = "none";
   });
-  document.getElementById("ctxEdit").addEventListener("click", () => {
+  document.getElementById("ctxDelete").addEventListener("click", () => {
     if (!_ctxRow) return;
-    // Focus the first editable cell
-    const cell = _ctxRow.querySelector(".editable");
-    if (cell) { cell.focus(); }
-  });
-  document.getElementById("ctxAdd").addEventListener("click", () => {
-    if (!_ctxRow) return;
-    const tbody = document.getElementById("clickLogTbody");
-    const newTr = document.createElement("tr");
-    newTr.className = "click-row";
-    newTr.draggable = true;
-    newTr.dataset.rowType = "click";
-    newTr.dataset.clickId = "new";
-    newTr.innerHTML = `<td class="cle-id">+</td><td>—</td><td>—</td><td>—</td><td class="editable" contenteditable="true" data-field="cluster">—</td><td class="dbh-cell">—</td><td>Manual</td>`;
-    setupRowDragDrop(newTr);
-    setupRowContextMenu(newTr);
-    _ctxRow.after(newTr);
-  });
-  document.getElementById("ctxDrop").addEventListener("click", () => {
-    if (!_ctxRow) return;
-    const tbody = document.getElementById("clickLogTbody");
-    tbody.appendChild(_ctxRow); // move to bottom
+    const rowType = _ctxRow.dataset.rowType;
+    if (rowType === 'ann') {
+      // Delete annotation row — remove the annotation point (pink marker)
+      const annIdx = parseInt(_ctxRow.dataset.annIdx);
+      if (annIdx >= 0 && annotationPositions && annIdx < annotationPositions.length) {
+        _pushAnnUndo(annIdx);
+        annotationPositions[annIdx]._deleted = true;
+        if (annIdx < annotationMarkers.length && annotationMarkers[annIdx]) {
+          annotationMarkers[annIdx].visible = false;
+        }
+        // Hide associated DBH cylinder
+        dbhCylinders.forEach(c => { if (c.userData.annIdx === annIdx) c.visible = false; });
+        _ctxRow.remove();
+        status(`Annotation A${annIdx+1} deleted. Ctrl+Z to undo.`);
+      }
+    } else if (rowType === 'click') {
+      // Delete click marker row
+      const clickId = parseInt(_ctxRow.dataset.clickId);
+      const idx = clickedPoints.findIndex(c => c.id === clickId);
+      if (idx >= 0) {
+        const removedClick = clickedPoints[idx];
+        const marker = clickMarkers[idx];
+        if (marker) {
+          const markerPos = marker.position.clone();
+          const markerScene = marker.parent || scene;
+          _pushClickRemoveUndo(removedClick, markerPos, markerScene);
+          if (marker.parent) marker.parent.remove(marker);
+        }
+        clickMarkers.splice(idx, 1);
+        clickedPoints.splice(idx, 1);
+        // Remove associated DBH cylinders
+        const toRemove = dbhCylinders.filter(c => c.userData.clickIdx === idx);
+        toRemove.forEach(c => { if (c.parent) c.parent.remove(c); });
+        dbhCylinders = dbhCylinders.filter(c => c.userData.clickIdx !== idx);
+        updateClickCount();
+        autoSaveClicks();
+      }
+      _ctxRow.remove();
+      status(`Click entry deleted. Ctrl+Z to undo.`);
+    }
+    _ctxRow = null;
   });
 }
 
@@ -1677,6 +1792,8 @@ function clearDbhCylinders() {
 
 function _cylShouldBeVisible(annIdx, clickIdx) {
   if (!dbhCylindersVisible) return false;
+  // If annotations are globally hidden via eye toggle, hide all cylinders too
+  if (!annotationVisible) return false;
   // Click-marker cylinder (no annotation)
   if (annIdx === -1 || annIdx === undefined) {
     if (clickIdx === undefined || clickIdx < 0 || !clickedPoints[clickIdx]) return false;
@@ -1687,14 +1804,49 @@ function _cylShouldBeVisible(annIdx, clickIdx) {
   // Annotation cylinder
   if (!annotationPositions || annIdx >= annotationPositions.length) return false;
   const ann = annotationPositions[annIdx];
+  if (ann._deleted) return false;
   const fileVis = annotationFileVisibility[ann.file] !== false;
   if (!fileVis) return false;
-  if (activeIsolatedId !== null && ann.cluster !== activeIsolatedId) return false;
+  if (activeIsolatedId !== null) {
+    // In row mode: cylinders in other rows should stay visible
+    if (isRowMode && linRows.length > 0) {
+      let annRow = null, isoRow = null;
+      for (const r of linRows) {
+        if (ann.cluster !== undefined && ann.cluster >= 0 && r.clusterIds.includes(ann.cluster)) annRow = r;
+        if (r.clusterIds.includes(activeIsolatedId)) isoRow = r;
+      }
+      if (annRow && isoRow && annRow === isoRow) {
+        // Same row — only show for isolated cluster
+        if (ann.cluster !== activeIsolatedId) return false;
+      }
+      // Different row — keep visible
+    } else {
+      if (ann.cluster !== activeIsolatedId) return false;
+    }
+  }
   return true;
 }
 
 function buildDbhCylinders() {
   clearDbhCylinders();
+
+  // Helper: compute local ground Z for a given XY position within a row's cluster
+  function _localGroundZ(targetRow, clusterId, lx, ly) {
+    if (!targetRow || clusterId === undefined || clusterId < 0) return null;
+    const posAttr = targetRow.points.geometry.attributes.position;
+    const n = targetRow.labels.length;
+    let minZ = Infinity;
+    const searchRadius = 3.0; // meters
+    for (let i = 0; i < n; i++) {
+      if (targetRow.labels[i] !== clusterId) continue;
+      const px = posAttr.getX(i), py = posAttr.getY(i), pz = posAttr.getZ(i);
+      const dx = px - lx, dy = py - ly;
+      if (dx*dx + dy*dy < searchRadius * searchRadius) {
+        if (pz < minZ) minZ = pz;
+      }
+    }
+    return minZ < Infinity ? minZ : null;
+  }
 
   // ── Click-marker DBH cylinders ────────────────────────────────────────────
   if (clickedPoints && clickedPoints.length > 0) {
@@ -1711,7 +1863,11 @@ function buildDbhCylinders() {
       }
       const targetScene = targetRow ? targetRow.scene : scene;
       // exactX/Y/Z are row-local (same coord system as posAttr)
-      const lx = ck.exactX, ly = ck.exactY, lz = ck.exactZ;
+      const lx = ck.exactX, ly = ck.exactY;
+      // Compute ground Z and place cylinder at ground + 1.5m
+      let lz = ck.exactZ;
+      const groundZ = _localGroundZ(targetRow, ck.clusterId, lx, ly);
+      if (groundZ !== null) lz = groundZ + 1.5;
       const height = 1.0;
       const color = new THREE.Color(document.getElementById('markerColor').value || '#ff69b4');
       const geo = new THREE.CylinderGeometry(radius, radius, height, 32, 1, true);
@@ -1769,7 +1925,11 @@ function buildDbhCylinders() {
     const offZ = targetRow ? targetRow.centerOffset.z : 0;
     const lx = ann.x - offX;
     const ly = ann.y - offY;
-    const lz = ann.z - offZ;
+    // Compute ground Z and place cylinder at ground + 1.5m instead of annotation height
+    let lz = ann.z - offZ;
+    const annCluster = ann.cluster !== undefined ? ann.cluster : -1;
+    const groundZ = _localGroundZ(targetRow, annCluster, lx, ly);
+    if (groundZ !== null) lz = groundZ + 1.5;
 
     // Cylinder height: use 1 m as a visual reference slice
     const height = 1.0;
@@ -2371,16 +2531,66 @@ function buildAnnotationMarkers() {
 
 function toggleAnnotationVisibility(visible) {
   annotationVisible = visible;
+  // Toggle file-uploaded annotation markers
   annotationMarkers.forEach((m, i) => {
     if (i >= annotationPositions.length) return;
     const ann = annotationPositions[i];
+    if (ann._deleted) { m.visible = false; return; }
     const fileVis = annotationFileVisibility[ann.file] !== false;
     let show = annotationVisible && fileVis;
-    // Respect cluster isolation
-    if (show && activeIsolatedId !== null && ann.cluster !== activeIsolatedId) show = false;
+    // Respect cluster isolation (with row-aware logic)
+    if (show && activeIsolatedId !== null) {
+      if (isRowMode && linRows.length > 0) {
+        let annRow = null, isoRow = null;
+        for (const r of linRows) {
+          if (ann.cluster !== undefined && ann.cluster >= 0 && r.clusterIds.includes(ann.cluster)) annRow = r;
+          if (r.clusterIds.includes(activeIsolatedId)) isoRow = r;
+        }
+        if (annRow && isoRow && annRow === isoRow) {
+          // Same row as isolated cluster — only show if it matches the isolated cluster
+          if (ann.cluster !== activeIsolatedId) show = false;
+        }
+        // Different row — keep visible (show stays true)
+      } else {
+        if (ann.cluster !== activeIsolatedId) show = false;
+      }
+    }
     m.visible = show;
   });
-  // Cylinders are independent — controlled only by 🌳 toggle
+  // Also toggle user-created click markers (double-click placed points)
+  clickMarkers.forEach((m, i) => {
+    if (!m) return;
+    if (!annotationVisible) { m.visible = false; return; }
+    const click = clickedPoints[i];
+    if (!click) { m.visible = false; return; }
+    // Respect cluster isolation (with row-aware logic)
+    if (activeIsolatedId !== null) {
+      if (isRowMode && linRows.length > 0) {
+        let clickRow = null, isoRow = null;
+        for (const r of linRows) {
+          if (click.clusterId !== undefined && click.clusterId >= 0 && r.clusterIds.includes(click.clusterId)) clickRow = r;
+          if (r.clusterIds.includes(activeIsolatedId)) isoRow = r;
+        }
+        if (clickRow && isoRow && clickRow === isoRow) {
+          m.visible = (click.clusterId === activeIsolatedId);
+        } else {
+          m.visible = true; // different row — keep visible
+        }
+      } else {
+        m.visible = (click.clusterId === activeIsolatedId);
+      }
+    } else {
+      m.visible = true;
+    }
+  });
+  // Also toggle DBH cylinders alongside annotations
+  dbhCylinders.forEach(m => {
+    if (annotationVisible) {
+      m.visible = _cylShouldBeVisible(m.userData.annIdx, m.userData.clickIdx);
+    } else {
+      m.visible = false;
+    }
+  });
 }
 
 function toggleAnnotationFile(filename, visible) {
@@ -2400,13 +2610,31 @@ function filterAnnotationsByCluster(clusterId) {
   annotationMarkers.forEach((m, i) => {
     if (i < annotationPositions.length) {
       const ann = annotationPositions[i];
+      if (ann._deleted) { m.visible = false; return; }
       const fileVis = annotationFileVisibility[ann.file] !== false;
       if (clusterId === null) {
         // Show all (respecting file visibility)
         m.visible = annotationVisible && fileVis;
       } else {
-        // Only show annotations belonging to this cluster
-        m.visible = annotationVisible && fileVis && (ann.cluster === clusterId);
+        // In row mode: annotations in OTHER rows (not the isolated cluster's row) stay visible
+        if (isRowMode && linRows.length > 0) {
+          // Find if this annotation's cluster is in the same row as the isolated cluster
+          let annRow = null, isoRow = null;
+          for (const r of linRows) {
+            if (ann.cluster !== undefined && ann.cluster >= 0 && r.clusterIds.includes(ann.cluster)) annRow = r;
+            if (r.clusterIds.includes(clusterId)) isoRow = r;
+          }
+          if (annRow && isoRow && annRow === isoRow) {
+            // Same row as isolated cluster — only show if it matches the isolated cluster
+            m.visible = annotationVisible && fileVis && (ann.cluster === clusterId);
+          } else {
+            // Different row — keep visible
+            m.visible = annotationVisible && fileVis;
+          }
+        } else {
+          // Single-scene mode — only show annotations belonging to this cluster
+          m.visible = annotationVisible && fileVis && (ann.cluster === clusterId);
+        }
       }
     }
   });
@@ -2731,8 +2959,13 @@ function doDbhSlice() {
   // Auto-place circle on entry:
   // • Edit mode  → use existing DBH position + radius
   // • Add mode   → place at the marker's trunk position with a default radius
+  // IMPORTANT: Always snap Z to slice height (ground+1.5m) so cylinder appears at trunk level
   let editCenter = null;
   let editRadius = null;
+  // Compute slice Z for snapping the circle down to 1.5m from ground
+  const midGzForSnap = grid.cells[Math.floor(grid.nx/2)][Math.floor(grid.ny/2)] || 0;
+  const sliceZForSnap = midGzForSnap + dbhSliceOffset;
+
   if (_editingDbhAnnIdx >= 0 && annotationPositions && annotationPositions[_editingDbhAnnIdx]) {
     const ann = annotationPositions[_editingDbhAnnIdx];
     const dbhVal = ann._dbh != null ? ann._dbh : ann.dbh;
@@ -2740,16 +2973,20 @@ function doDbhSlice() {
     // For Edit: use existing DBH value; for Add: just use the trunk centre
     editRadius = dbhVal != null ? Number(dbhVal) / 2 : null;
     if (r) {
-      editCenter = new THREE.Vector3(
-        ann.x - r.centerOffset.x,
-        ann.y - r.centerOffset.y,
-        ann.z - r.centerOffset.z
-      );
+      const localX = ann.x - r.centerOffset.x;
+      const localY = ann.y - r.centerOffset.y;
+      // Compute ground Z at this specific XY and snap to ground+1.5m
+      const localGroundZ = getGroundZ(grid, localX, localY);
+      const snappedZ = localGroundZ + dbhSliceOffset;
+      editCenter = new THREE.Vector3(localX, localY, snappedZ);
     }
   } else if (_editingDbhClickIdx >= 0 && clickedPoints[_editingDbhClickIdx]) {
     const ck = clickedPoints[_editingDbhClickIdx];
     editRadius = ck.dbh != null ? Number(ck.dbh) / 2 : null;
-    editCenter = new THREE.Vector3(ck.exactX, ck.exactY, ck.exactZ);
+    // Snap click marker Z down to ground+1.5m
+    const localGroundZ = getGroundZ(grid, ck.exactX, ck.exactY);
+    const snappedZ = localGroundZ + dbhSliceOffset;
+    editCenter = new THREE.Vector3(ck.exactX, ck.exactY, snappedZ);
   }
   if (editCenter) {
     // Default radius when adding: proportional to camera distance (same as placeDbhCircle)
@@ -2785,23 +3022,36 @@ function placeDbhCircle(pos3d) {
   rebuildDbhCircle(); dbhConfirmPending=true; updateDbhCircleDisplay();
 }
 
-// Commit the active circle: find nearest annotation, store in placed array, keep mesh on screen
+// Commit the active circle: store in placed array, keep mesh on screen
 function commitActiveCircle() {
   if(!dbhCircleMesh || !dbhCircleCenter) return;
   const d = dbhCircleRadius * 2, dStr = d.toFixed(4);
+
+  // Determine which annotation this circle belongs to.
+  // CRITICAL: Use the known editing index when available — do NOT do a blind
+  // spatial search that can grab annotations from other rows/clusters.
   let annIdx = -1;
-  if(annotationPositions && dbhTargetRow) {
+  if (_editingDbhAnnIdx >= 0) {
+    // We are editing a specific annotation — use it directly
+    annIdx = _editingDbhAnnIdx;
+  } else if (_editingDbhClickIdx >= 0) {
+    // We are editing a click marker — no annotation to match
+    annIdx = -1;
+  } else if (annotationPositions && dbhTargetRow) {
+    // Multi-tree mode (no specific target) — spatial search within same cluster only
     let bestDist = Infinity;
-    const offX=dbhTargetRow.centerOffset.x, offY=dbhTargetRow.centerOffset.y;
-    annotationPositions.forEach((ann,i) => {
-      if(activeIsolatedId!==null && ann.cluster!==activeIsolatedId) return;
-      // Skip annotations already committed
-      if(dbhPlacedCircles.some(pc => pc.annIdx === i)) return;
-      const dx=ann.x-(dbhCircleCenter.x+offX), dy=ann.y-(dbhCircleCenter.y+offY);
-      const dd=Math.sqrt(dx*dx+dy*dy);
-      if(dd<bestDist){bestDist=dd; annIdx=i;}
+    const offX = dbhTargetRow.centerOffset.x, offY = dbhTargetRow.centerOffset.y;
+    annotationPositions.forEach((ann, i) => {
+      if (activeIsolatedId !== null && ann.cluster !== activeIsolatedId) return;
+      if (ann._deleted) return;
+      // Skip annotations already committed in this session
+      if (dbhPlacedCircles.some(pc => pc.annIdx === i)) return;
+      const dx = ann.x - (dbhCircleCenter.x + offX), dy = ann.y - (dbhCircleCenter.y + offY);
+      const dd = Math.sqrt(dx * dx + dy * dy);
+      if (dd < bestDist) { bestDist = dd; annIdx = i; }
     });
   }
+
   // Recolor the editing cylinder to the normal marker color now that it's committed
   if (dbhCircleMesh) {
     const normalColor = new THREE.Color(document.getElementById('markerColor').value || '#ff69b4');
@@ -2918,6 +3168,53 @@ function confirmDbhCircle(){
     // ─ Write to annotation if we were editing an annotation ─
     if(pc.annIdx >= 0 && annotationPositions && pc.annIdx < annotationPositions.length) {
       annotationPositions[pc.annIdx]._dbh = pc.diameter;
+
+      // ── Move annotation point to cylinder position (Change 3) ──
+      // pc.center is in row-local coordinates; convert back to global lin_c coords
+      if (dbhTargetRow && pc.center) {
+        const newX = pc.center.x + dbhTargetRow.centerOffset.x;
+        const newY = pc.center.y + dbhTargetRow.centerOffset.y;
+        const newZ = pc.center.z + dbhTargetRow.centerOffset.z;
+        annotationPositions[pc.annIdx].x = newX;
+        annotationPositions[pc.annIdx].y = newY;
+        annotationPositions[pc.annIdx].z = newZ;
+
+        // Update orig_x/y/z by finding nearest original point in the row
+        if (dbhTargetRow.origXYZ && dbhTargetRow.origXYZ.length > 0) {
+          const posAttr = dbhTargetRow.points.geometry.attributes.position;
+          const n = posAttr.count;
+          let bestDist = Infinity, bestIdx = -1;
+          for (let j = 0; j < n; j++) {
+            const dx = posAttr.getX(j) - pc.center.x;
+            const dy = posAttr.getY(j) - pc.center.y;
+            const d2 = dx*dx + dy*dy; // XY distance only (cylinder is at trunk XY)
+            if (d2 < bestDist) { bestDist = d2; bestIdx = j; }
+          }
+          if (bestIdx >= 0 && bestIdx * 3 + 2 < dbhTargetRow.origXYZ.length) {
+            annotationPositions[pc.annIdx].orig_x = dbhTargetRow.origXYZ[bestIdx * 3];
+            annotationPositions[pc.annIdx].orig_y = dbhTargetRow.origXYZ[bestIdx * 3 + 1];
+            annotationPositions[pc.annIdx].orig_z = dbhTargetRow.origXYZ[bestIdx * 3 + 2];
+          }
+        }
+
+        // Update the 3D annotation marker position
+        if (pc.annIdx < annotationMarkers.length && annotationMarkers[pc.annIdx]) {
+          annotationMarkers[pc.annIdx].position.set(pc.center.x, pc.center.y, pc.center.z);
+        }
+
+        // Update click log table row coordinates
+        tbody.querySelectorAll("tr.ann-row").forEach(tr => {
+          if(parseInt(tr.dataset.annIdx) === pc.annIdx) {
+            const cells = tr.querySelectorAll("td");
+            if (cells.length >= 4) {
+              cells[1].textContent = Number(annotationPositions[pc.annIdx].orig_x).toFixed(3);
+              cells[2].textContent = Number(annotationPositions[pc.annIdx].orig_y).toFixed(3);
+              cells[3].textContent = Number(annotationPositions[pc.annIdx].orig_z).toFixed(3);
+            }
+          }
+        });
+      }
+
       tbody.querySelectorAll("tr.ann-row").forEach(tr => {
         if(parseInt(tr.dataset.annIdx) === pc.annIdx) {
           const c = tr.querySelector(".dbh-cell");
@@ -2936,6 +3233,35 @@ function confirmDbhCircle(){
     const pc = dbhPlacedCircles[dbhPlacedCircles.length - 1];
     if (pc) {
       click.dbh = pc.diameter;
+
+      // ── Move click marker to cylinder position (Change 3) ──
+      if (pc.center) {
+        click.exactX = pc.center.x;
+        click.exactY = pc.center.y;
+        click.exactZ = pc.center.z;
+        // Update original XYZ by finding nearest point in the row
+        if (dbhTargetRow && dbhTargetRow.origXYZ && dbhTargetRow.origXYZ.length > 0) {
+          const posAttr = dbhTargetRow.points.geometry.attributes.position;
+          const n = posAttr.count;
+          let bestDist = Infinity, bestIdx = -1;
+          for (let j = 0; j < n; j++) {
+            const dx = posAttr.getX(j) - pc.center.x;
+            const dy = posAttr.getY(j) - pc.center.y;
+            const d2 = dx*dx + dy*dy;
+            if (d2 < bestDist) { bestDist = d2; bestIdx = j; }
+          }
+          if (bestIdx >= 0 && bestIdx * 3 + 2 < dbhTargetRow.origXYZ.length) {
+            click.originalX = dbhTargetRow.origXYZ[bestIdx * 3];
+            click.originalY = dbhTargetRow.origXYZ[bestIdx * 3 + 1];
+            click.originalZ = dbhTargetRow.origXYZ[bestIdx * 3 + 2];
+          }
+        }
+        // Move the 3D click marker
+        if (_editingDbhClickIdx < clickMarkers.length && clickMarkers[_editingDbhClickIdx]) {
+          clickMarkers[_editingDbhClickIdx].position.set(pc.center.x, pc.center.y, pc.center.z);
+        }
+      }
+
       tbody.querySelectorAll("tr.click-row").forEach(tr => {
         if (parseInt(tr.dataset.clickId) === click.id) {
           const c = tr.querySelector(".dbh-cell");
@@ -3193,8 +3519,7 @@ function loadCloud(data) {
   status(`Loaded: ${data.name} — ${data.meta.num_points.toLocaleString()} pts, ${data.meta.n_clusters} clusters. Double-click to mark.`);
   document.getElementById("ptCount").textContent = `Lin: ${data.linearized.displayed.toLocaleString()} · Cls: ${data.clustered.displayed.toLocaleString()}`;
 
-  // Restore any previously saved clicks for this cloud
-  loadSavedClicks();
+  // Do NOT restore previously saved clicks — study starts fresh each time
 }
 
 
@@ -3203,6 +3528,16 @@ function loadCloud(data) {
 // ═══════════════════════════════════════════════════════════
 
 function loadRawCloud(data) {
+  // ── Full state reset: new upload = fresh study, no carryover ──
+  clickedPoints = [];
+  clickIdCounter = 0;
+  clickMarkers.forEach(m => { if (m.parent) m.parent.remove(m); });
+  clickMarkers = [];
+  _undoStack = [];
+  annotationFileVisibility = {};
+  annotationVisible = true;
+  clearClickLog();
+
   clearScene();
   cloudData = data; cloudId = data.id;
   isRawMode = true;
@@ -3393,7 +3728,19 @@ function isolateCluster(clusterId) {
     const count = stats ? stats.count.toLocaleString() : '?';
     document.getElementById("isolatedLabel").innerHTML =
       `<span style="display:inline-block;width:12px;height:12px;border-radius:3px;background:${rgb};vertical-align:middle;margin-right:6px;border:1px solid rgba(255,255,255,.4)"></span>Cluster #${clusterId} — ${count} pts`;
-    document.getElementById("isolatedBanner").style.display = "flex";
+    const banner = document.getElementById("isolatedBanner");
+    banner.style.display = "flex";
+    // Position banner at the top of the row containing the isolated cluster
+    if (targetRow) {
+      const rowIdx = linRows.indexOf(targetRow);
+      if (rowIdx >= 0) {
+        const rowH = effectiveRowHeight();
+        const container = document.getElementById("viewportContainer");
+        const rowTop = rowIdx * (rowH + ROW_GAP);
+        const scrollOffset = container ? container.scrollTop : 0;
+        banner.style.top = (rowTop - scrollOffset + 8) + "px";
+      }
+    }
     highlightClusterItem(clusterId);
     const visibleClicks = clickedPoints.filter(c => c.clusterId === clusterId).length;
     status(`Cluster #${clusterId}: ${count} pts · ${visibleClicks} saved clicks`);
@@ -3452,7 +3799,9 @@ function clearIsolation() {
       fitCameraFront(r.points, r.camera, r.vp);
     });
     activeIsolatedId = null;
-    document.getElementById("isolatedBanner").style.display = "none";
+    const banner = document.getElementById("isolatedBanner");
+    banner.style.display = "none";
+    banner.style.top = "8px"; // reset to default position
     document.querySelectorAll(".row-label").forEach(el => el.style.display = "");
     highlightClusterItem(-1);
     // Show all markers in linearized view
@@ -3670,8 +4019,7 @@ function reloadViews(d) {
   }
   updateDBTree();
 
-  // Restore user-placed click markers (same as loadCloud)
-  loadSavedClicks();
+  // Do NOT restore previously saved clicks — study starts fresh each time
 
   cloudData.linearized = d.linearized;
   cloudData.clustered = d.clustered;
@@ -3779,8 +4127,10 @@ function clearScene() {
   clearAnnotationMarkers();
   clearDbhCylinders();
   annotationPositions = null;
-  // Keep annotationFileVisibility and annotationVisible across reclusters
-  // They are only fully reset when _clearAll is called
+  // Reset annotation file visibility on new scene clear
+  annotationFileVisibility = {};
+  annotationVisible = true;
+  _undoStack = [];
   linInstanceLabels = null;
   // Clean DBH state without calling closeSliceTool (which calls clearIsolation)
   dbhSliceActive = false; dbhConfirmPending = false; dbhTopViewMode = false;
